@@ -1,0 +1,22 @@
+services:
+  mail-sync:
+    build:
+      context: .
+    restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      TZ: Asia/Shanghai
+      MAIL_SYNC_STATE_DB: /data/mail_sync_state.sqlite3
+      SYNC_INTERVAL: ${SYNC_INTERVAL:-60}
+      SYNC_BATCH_SIZE: ${SYNC_BATCH_SIZE:-5}
+    volumes:
+      - ./config.json:/app/config.json:ro
+      - ./data:/data
+    tmpfs:
+      - /tmp
+    stop_grace_period: 30s

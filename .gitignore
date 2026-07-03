@@ -1,0 +1,11 @@
+.DS_Store
+.env
+__pycache__/
+*.pyc
+
+# Credentials and runtime state
+config.json
+data/
+mail_sync_state.sqlite3
+mail_sync_state.sqlite3-*
+mail_sync_state.sqlite3.lock

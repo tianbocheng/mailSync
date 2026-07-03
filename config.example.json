@@ -1,0 +1,144 @@
+{
+  "state_db": "mail_sync_state.sqlite3",
+  "target": {
+    "email": "tianbocheng@lantian2019.cn",
+    "password": "CHANGE_ME",
+    "imap_server": "imap.lantian2019.cn",
+    "imap_port": 993,
+    "use_ssl": true,
+    "folder": "INBOX"
+  },
+  "sources": [
+    {
+      "email": "790209876@qq.com",
+      "password": "CHANGE_ME",
+      "imap_server": "imap.qq.com",
+      "imap_port": 993,
+      "use_ssl": true,
+      "account_label": "SYNC:790209876@qq.com",
+      "exclude_folders": ["Drafts"],
+      "folder_labels": {
+        "INBOX": "BOX:收件箱",
+        "Sent Messages": "BOX:已发邮件",
+        "Deleted Messages": "BOX:已删除邮件",
+        "Junk": "BOX:垃圾邮件"
+      },
+      "default_folder_label": "BOX:其他文件夹",
+      "deleted_label": "BOX:已删除邮件"
+    },
+    {
+      "email": "tianbocheng11@gmail.com",
+      "password": "CHANGE_ME",
+      "imap_server": "imap.gmail.com",
+      "imap_port": 993,
+      "use_ssl": true,
+      "account_label": "SYNC:tianbocheng11@gmail.com",
+      "exclude_folders": ["[Gmail]/&g0l6Pw-"],
+      "folder_labels": {
+        "INBOX": "BOX:收件箱",
+        "[Gmail]/&XfJT0ZCuTvY-": "BOX:已发邮件",
+        "[Gmail]/&V4NXPpCuTvY-": "BOX:垃圾邮件",
+        "[Gmail]/&XfJSIJZkkK5O9g-": "BOX:已删除邮件"
+      },
+      "default_folder_label": "BOX:其他文件夹",
+      "deleted_label": "BOX:已删除邮件"
+    },
+    {
+      "email": "tianbocheng@teleinfo.cn",
+      "password": "CHANGE_ME",
+      "imap_server": "imap.caict.ac.cn",
+      "imap_port": 993,
+      "use_ssl": true,
+      "account_label": "SYNC:tianbocheng@teleinfo.cn",
+      "exclude_folders": ["Drafts"],
+      "folder_labels": {
+        "INBOX": "BOX:收件箱",
+        "Sent Items": "BOX:已发邮件",
+        "Trash": "BOX:已删除邮件",
+        "Junk E-mail": "BOX:垃圾邮件",
+        "Virus Items": "BOX:病毒文件夹"
+      },
+      "default_folder_label": "BOX:其他文件夹",
+      "deleted_label": "BOX:已删除邮件"
+    },
+    {
+      "email": "tianbocheng@caict.ac.cn",
+      "password": "CHANGE_ME",
+      "imap_server": "imap.caict.ac.cn",
+      "imap_port": 993,
+      "use_ssl": true,
+      "account_label": "SYNC:tianbocheng@caict.ac.cn",
+      "exclude_folders": ["Drafts"],
+      "folder_labels": {
+        "INBOX": "BOX:收件箱",
+        "Sent Items": "BOX:已发邮件",
+        "Trash": "BOX:已删除邮件",
+        "Junk E-mail": "BOX:垃圾邮件",
+        "Virus Items": "BOX:病毒文件夹"
+      },
+      "default_folder_label": "BOX:其他文件夹",
+      "deleted_label": "BOX:已删除邮件"
+    },
+    {
+      "email": "lantiankeji2019@163.com",
+      "password": "CHANGE_ME",
+      "imap_server": "imap.163.com",
+      "imap_port": 993,
+      "use_ssl": true,
+      "imap_id": {
+        "name": "mail-sync",
+        "version": "1.0.0",
+        "vendor": "tianbocheng",
+        "support-email": "lantiankeji2019@163.com"
+      },
+      "account_label": "SYNC:lantiankeji2019@163.com",
+      "exclude_folders": ["&g0l6P3ux-"],
+      "folder_labels": {
+        "INBOX": "BOX:收件箱",
+        "&XfJT0ZAB-": "BOX:已发邮件",
+        "&XfJSIJZk-": "BOX:已删除邮件",
+        "&V4NXPpCuTvY-": "BOX:垃圾邮件",
+        "&dcVr0mWHTvZZOQ-": "BOX:病毒文件夹",
+        "&Xn9USpCuTvY-": "BOX:广告邮件",
+        "&i6KWBZCuTvY-": "BOX:订阅邮件"
+      },
+      "default_folder_label": "BOX:其他文件夹",
+      "deleted_label": "BOX:已删除邮件"
+    },
+    {
+      "email": "ndi@caict.ac.cn",
+      "password": "CHANGE_ME",
+      "imap_server": "imap.caict.ac.cn",
+      "imap_port": 993,
+      "use_ssl": true,
+      "account_label": "SYNC:ndi@caict.ac.cn",
+      "exclude_folders": ["Drafts"],
+      "folder_labels": {
+        "INBOX": "BOX:收件箱",
+        "Sent Items": "BOX:已发邮件",
+        "Trash": "BOX:已删除邮件",
+        "Junk E-mail": "BOX:垃圾邮件",
+        "Virus Items": "BOX:病毒文件夹"
+      },
+      "default_folder_label": "BOX:其他文件夹",
+      "deleted_label": "BOX:已删除邮件"
+    }
+  ],
+  "synology_labels": {
+    "$synolabel_3u0m42bc": "SYNC:tianbocheng@teleinfo.cn",
+    "$synolabel_4rdiqzy6": "BOX:其他文件夹",
+    "$synolabel_5kg85oh3": "SYNC:lantiankeji2019@163.com",
+    "$synolabel_60fsfeg4": "SYNC:tianbocheng@lantian2019.cn",
+    "$synolabel_8got6w7w": "SYNC:tianbocheng11@gmail.com",
+    "$synolabel_a1viawp9": "SYNC:790209876@qq.com",
+    "$synolabel_brfydqni": "BOX:已发邮件",
+    "$synolabel_dbbepozt": "BOX:病毒文件夹",
+    "$synolabel_e3lo41l0": "BOX:垃圾邮件",
+    "$synolabel_ginwmdwe": "SYNC:tianbocheng@caict.ac.cn",
+    "$synolabel_n65xejvo": "BOX:收件箱",
+    "$synolabel_rcs86u3g": "BOX:订阅邮件",
+    "$synolabel_t3nexc5o": "BOX:已删除邮件",
+    "$synolabel_w0jqq15v": "SYNC:ndi@caict.ac.cn",
+    "$synolabel_ydvykj6j": "BOX:广告邮件"
+  }
+}

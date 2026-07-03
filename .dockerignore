@@ -1,0 +1,8 @@
+config.json
+mail_sync_state.sqlite3
+mail_sync_state.sqlite3-*
+mail_sync_state.sqlite3.lock
+__pycache__/
+*.pyc
+.git/
+.DS_Store
