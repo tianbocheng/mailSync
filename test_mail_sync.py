@@ -2,10 +2,47 @@ import json
 import tempfile
 import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
 import mail_sync
+
+
+class MessageDateTests(unittest.TestCase):
+    def test_internal_date_takes_precedence_over_date_header(self):
+        metadata = b'1 (INTERNALDATE "01-Jun-2026 09:38:23 +0800")'
+        raw = b"Date: Mon, 8 May 2023 15:05:39 +0800\r\n\r\nbody\r\n"
+
+        result = mail_sync.source_message_date(metadata, raw)
+
+        self.assertEqual(
+            result,
+            datetime.fromisoformat("2026-06-01T09:38:23+08:00"),
+        )
+
+    def test_date_header_is_used_when_internal_date_is_omitted(self):
+        metadata = b"1 (UID 1 FLAGS (\\Seen))"
+        raw = b"Date: Mon, 8 May 2023 15:05:39 +0800\r\n\r\nbody\r\n"
+
+        result = mail_sync.source_message_date(metadata, raw)
+
+        self.assertEqual(
+            result,
+            datetime.fromisoformat("2023-05-08T15:05:39+08:00"),
+        )
+
+    def test_naive_date_header_is_treated_as_utc(self):
+        result = mail_sync.parse_message_date(
+            b"Date: Mon, 8 May 2023 15:05:39\r\n\r\n"
+        )
+
+        self.assertEqual(result.tzinfo, timezone.utc)
+
+    def test_invalid_date_header_returns_none(self):
+        self.assertIsNone(
+            mail_sync.parse_message_date(b"Date: definitely-not-a-date\r\n\r\n")
+        )
 
 
 class FakeImap:

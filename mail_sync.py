@@ -30,6 +30,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email import message_from_bytes
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -56,6 +57,7 @@ NO_CHANGE_ACTIONS = {
     "unchanged",
     "duplicate_location_ignored",
     "quarantined",
+    "source_location_added",
 }
 
 
@@ -502,6 +504,26 @@ def parse_internal_date(metadata: bytes) -> Optional[datetime]:
     )
 
 
+def parse_message_date(raw: bytes) -> Optional[datetime]:
+    """Return the RFC message date when a server omits IMAP INTERNALDATE."""
+    value = message_from_bytes(raw).get("Date")
+    if not value:
+        return None
+    try:
+        parsed = parsedate_to_datetime(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def source_message_date(metadata: bytes, raw: bytes) -> Optional[datetime]:
+    return parse_internal_date(metadata) or parse_message_date(raw)
+
+
 def parse_flags(metadata: bytes) -> Tuple[str, ...]:
     match = FLAGS_RE.search(metadata)
     if not match:
@@ -698,7 +720,7 @@ def fetch_source_message(
         raw=raw,
         content_hash=hashlib.sha256(raw).hexdigest(),
         message_id=message_id.strip() if message_id else None,
-        internal_date=parse_internal_date(metadata),
+        internal_date=source_message_date(metadata, raw),
         system_flags=parse_flags(metadata),
     )
 
@@ -1662,12 +1684,23 @@ def sync_message(
             action = "existing_rebuilt"
     else:
         existing_folder_labels = row_folder_labels(existing)
+        stored_internal_date = (
+            datetime.fromisoformat(existing["internal_date"])
+            if existing["internal_date"]
+            else None
+        )
         if (
             existing["source_folder"] == "__deleted__"
             or existing["account_label"] != account_label_name
         ):
             old_target_uid = int(existing["target_uid"])
             action = "rebuilt"
+        elif stored_internal_date != message.internal_date:
+            # Some IMAP servers omit INTERNALDATE. Older versions then APPENDed
+            # with no date, causing the target to assign the current year.
+            old_target_uid = int(existing["target_uid"])
+            desired_folder_labels = existing_folder_labels
+            action = "date_rebuilt"
         elif folder_label_name not in existing_folder_labels:
             target_uid = int(existing["target_uid"])
             select_mailbox(target, target_folder, readonly=False)
@@ -1901,7 +1934,7 @@ def reconcile_deleted_messages(
             internal_date=(
                 datetime.fromisoformat(row["internal_date"])
                 if row["internal_date"]
-                else parse_internal_date(metadata)
+                else source_message_date(metadata, raw)
             ),
             system_flags=tuple(json.loads(row["source_flags"])),
         )
@@ -2159,7 +2192,7 @@ def command_sync(
                             uidvalidity,
                             uid,
                         )
-                        if known is not None:
+                        if known is not None and known["internal_date"] is not None:
                             db.execute(
                                 """
                                 UPDATE message_locations
@@ -2190,7 +2223,7 @@ def command_sync(
                             )
                             action = "unchanged"
                         else:
-                            if uid in skipped_uids:
+                            if known is None and uid in skipped_uids:
                                 action = "source_message_configured_skip"
                                 summary[action] = summary.get(action, 0) + 1
                                 total_scanned += 1
