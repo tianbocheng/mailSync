@@ -44,6 +44,36 @@
       "deleted_label": "BOX:已删除邮件"
     },
     {
+      "email": "your-account@outlook.com",
+      "imap_server": "outlook.office365.com",
+      "imap_port": 993,
+      "use_ssl": true,
+      "auth": {
+        "type": "oauth2",
+        "provider": "microsoft",
+        "client_id": "YOUR_MICROSOFT_ENTRA_APPLICATION_CLIENT_ID",
+        "tenant": "common",
+        "token_file": "/data/outlook-your-account-token.json",
+        "scopes": [
+          "https://outlook.office.com/IMAP.AccessAsUser.All",
+          "offline_access"
+        ]
+      },
+      "account_label": "SYNC:your-account@outlook.com",
+      "exclude_folders": ["Drafts"],
+      "folder_labels": {
+        "INBOX": "BOX:收件箱",
+        "Sent": "BOX:已发邮件",
+        "Sent Items": "BOX:已发邮件",
+        "Deleted": "BOX:已删除邮件",
+        "Deleted Items": "BOX:已删除邮件",
+        "Junk": "BOX:垃圾邮件",
+        "Junk Email": "BOX:垃圾邮件"
+      },
+      "default_folder_label": "BOX:其他文件夹",
+      "deleted_label": "BOX:已删除邮件"
+    },
+    {
       "email": "tianbocheng@teleinfo.cn",
       "password": "CHANGE_ME",
       "imap_server": "imap.caict.ac.cn",
@@ -136,6 +166,7 @@
     "$synolabel_e3lo41l0": "BOX:垃圾邮件",
     "$synolabel_ginwmdwe": "SYNC:tianbocheng@caict.ac.cn",
     "$synolabel_n65xejvo": "BOX:收件箱",
+    "$synolabel_replace_outlook": "SYNC:your-account@outlook.com",
     "$synolabel_rcs86u3g": "BOX:订阅邮件",
     "$synolabel_t3nexc5o": "BOX:已删除邮件",
     "$synolabel_w0jqq15v": "SYNC:ndi@caict.ac.cn",

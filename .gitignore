@@ -2,8 +2,8 @@
 .env
 __pycache__/
 *.pyc
+*outlook*token*.json
 
-# Runtime sidecars and Docker bind-mount data
-data/
+# Runtime sidecars
 mail_sync_state.sqlite3-*
 mail_sync_state.sqlite3.lock

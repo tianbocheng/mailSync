@@ -46,6 +46,67 @@ python3 mail_sync.py sync
 python3 mail_sync.py sync --source 790209876@qq.com
 ```
 
+## Outlook OAuth 配置
+
+Outlook.com 和 Microsoft 365 来源邮箱支持 OAuth2/XOAUTH2，不需要在配置中保存邮箱密码。
+
+1. 在 Microsoft Entra 管理中心注册应用。若需同时支持个人 Outlook.com
+   和组织账号，选择支持组织目录和个人 Microsoft 账号的应用类型。
+2. 在应用的“身份验证”中启用“允许公共客户端流”。
+3. 为应用添加 Office 365 Exchange Online 的委托权限
+   `IMAP.AccessAsUser.All`。如果租户禁止用户自行同意，需要管理员授予同意。
+4. 在 `sources` 中增加来源配置；完整字段可复制 `config.example.json`
+   中的 Outlook 示例。同时在 MailPlus 创建 `SYNC:<Outlook 邮箱>` 标签，并将
+   `synology_labels` 示例中的 `$synolabel_replace_outlook` 替换为该标签真实的
+   内部 ID。关键配置如下：
+
+```json
+{
+  "email": "your-account@outlook.com",
+  "imap_server": "outlook.office365.com",
+  "imap_port": 993,
+  "use_ssl": true,
+  "auth": {
+    "type": "oauth2",
+    "provider": "microsoft",
+    "client_id": "YOUR_MICROSOFT_ENTRA_APPLICATION_CLIENT_ID",
+    "tenant": "common",
+    "token_file": "/data/outlook-your-account-token.json",
+    "scopes": [
+      "https://outlook.office.com/IMAP.AccessAsUser.All",
+      "offline_access"
+    ]
+  }
+}
+```
+
+`token_file` 必须是可写且持久化的位置，每个邮箱必须使用不同文件。Docker
+部署使用 `/data/...`；直接在主机运行时可改成相对配置文件的
+`data/...`。同步器以权限 `0600` 原子保存令牌，并在访问令牌过期前自动用
+刷新令牌续期。
+
+首次授权执行：
+
+```bash
+docker compose run --rm mail-sync \
+  authorize-outlook --source your-account@outlook.com
+```
+
+按命令输出打开 Microsoft 验证地址并输入设备码。授权成功后，可先列出文件夹
+并验证同步：
+
+```bash
+docker compose run --rm mail-sync \
+  list-folders --source your-account@outlook.com
+
+docker compose run --rm mail-sync \
+  sync --source your-account@outlook.com --folder INBOX --limit 1 --newest-first
+```
+
+如果令牌被管理员撤销、密码变更策略要求重新登录，重新运行
+`authorize-outlook` 即可覆盖旧令牌。共享邮箱也可使用 OAuth：令牌由有权访问
+共享邮箱的用户授权，但来源配置中的 `email` 应填写共享邮箱地址。
+
 每 60 秒自动执行一次完整增量扫描：
 
 ```bash
@@ -76,10 +137,19 @@ docker compose logs -f mail-sync
 docker compose down
 ```
 
-Compose 将 `config.json` 只读挂载到容器，不会把密码复制进镜像。同步状态保存在 `mail-sync-state` 命名卷中；容器重建或 Docker 重启不会丢失增量进度。除非明确希望从头重新建立状态，否则不要执行 `docker compose down -v`。
+Compose 将 `config.json` 只读挂载到容器，不会把密码复制进镜像。同步状态保存在当前项目的 `./data` 目录中；容器重建或 Docker 重启不会丢失增量进度，备份整个项目目录时也会一起备份。
+
+Linux 服务器首次部署前需要创建目录并授予容器用户写权限：
+
+```bash
+mkdir -p data
+sudo chown -R 10001:10001 data
+```
+
+如需接续已有同步进度，应先停止本地同步程序，再使用 SQLite 的 `.backup` 命令生成一致的数据库副本，并将其放到服务器项目的 `data/mail_sync_state.sqlite3`。
 
 ## 配置和状态
 
 - `config.json`：唯一配置文件，包含邮箱凭据、同步规则和 MailPlus 标签映射。
 - `config.example.json`：不含密码的配置模板；首次部署先复制为 `config.json` 并填写密码。
-- `mail_sync_state.sqlite3`：增量同步状态，不应删除或多实例并发写入。
+- `data/mail_sync_state.sqlite3`：Docker 部署使用的增量同步状态，不应删除或多实例并发写入。
