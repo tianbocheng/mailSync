@@ -53,7 +53,7 @@
         "provider": "microsoft",
         "client_id": "YOUR_MICROSOFT_ENTRA_APPLICATION_CLIENT_ID",
         "tenant": "common",
-        "token_file": "/data/outlook-your-account-token.json",
+        "token_file": "data/outlook-your-account-token.json",
         "scopes": [
           "https://outlook.office.com/IMAP.AccessAsUser.All",
           "offline_access"

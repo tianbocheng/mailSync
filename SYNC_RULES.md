@@ -71,7 +71,7 @@ Outlook.com 和 Microsoft 365 来源邮箱支持 OAuth2/XOAUTH2，不需要在�
     "provider": "microsoft",
     "client_id": "YOUR_MICROSOFT_ENTRA_APPLICATION_CLIENT_ID",
     "tenant": "common",
-    "token_file": "/data/outlook-your-account-token.json",
+    "token_file": "data/outlook-your-account-token.json",
     "scopes": [
       "https://outlook.office.com/IMAP.AccessAsUser.All",
       "offline_access"
@@ -81,8 +81,8 @@ Outlook.com 和 Microsoft 365 来源邮箱支持 OAuth2/XOAUTH2，不需要在�
 ```
 
 `token_file` 必须是可写且持久化的位置，每个邮箱必须使用不同文件。Docker
-部署使用 `/data/...`；直接在主机运行时可改成相对配置文件的
-`data/...`。同步器以权限 `0600` 原子保存令牌，并在访问令牌过期前自动用
+和直接在主机运行均使用相对配置文件的 `data/...`。同步器以权限 `0600`
+原子保存令牌，并在访问令牌过期前自动用
 刷新令牌续期。
 
 首次授权执行：
