@@ -829,6 +829,179 @@ class PendingMultiLabelTests(unittest.TestCase):
             db.close()
 
 
+class RealtimeIncrementalTests(unittest.TestCase):
+    class OnePollStopEvent:
+        def __init__(self):
+            self.waits = 0
+            self.stopped = False
+
+        def is_set(self):
+            return self.stopped
+
+        def wait(self, _timeout):
+            self.waits += 1
+            if self.waits == 1:
+                return False
+            self.stopped = True
+            return True
+
+    def test_status_response_is_parsed_independent_of_value_order(self):
+        result = mail_sync.parse_mailbox_status(
+            [
+                b'INBOX (MESSAGES 12 UIDVALIDITY 44 UIDNEXT 19)',
+            ]
+        )
+
+        self.assertEqual(result, (44, 19, 12))
+
+    def test_status_response_requires_all_incremental_markers(self):
+        with self.assertRaises(mail_sync.SyncError):
+            mail_sync.parse_mailbox_status(
+                [b'INBOX (UIDNEXT 19 MESSAGES 12)']
+            )
+
+    def test_status_response_allows_servers_without_uidnext(self):
+        result = mail_sync.parse_mailbox_status(
+            [b'INBOX (MESSAGES 12 UIDVALIDITY 44)']
+        )
+
+        self.assertEqual(result, (44, 0, 12))
+
+    def test_incremental_candidates_exclude_known_folder_uids(self):
+        db = mail_sync.sqlite3.connect(":memory:")
+        db.execute(
+            """
+            CREATE TABLE message_locations (
+                source_email TEXT,
+                source_folder TEXT,
+                source_uidvalidity INTEGER,
+                source_uid INTEGER
+            )
+            """
+        )
+        db.executemany(
+            "INSERT INTO message_locations VALUES (?, ?, ?, ?)",
+            [
+                ("source@example.com", "INBOX", 9, 1),
+                ("source@example.com", "INBOX", 9, 3),
+                ("source@example.com", "Sent", 9, 2),
+                ("source@example.com", "INBOX", 8, 2),
+            ],
+        )
+
+        result = mail_sync.incremental_candidate_uids(
+            db,
+            "source@example.com",
+            "INBOX",
+            9,
+            [1, 2, 3, 4],
+        )
+
+        self.assertEqual(result, [2, 4])
+
+    def test_bulk_seen_update_only_marks_current_verified_locations(self):
+        db = mail_sync.sqlite3.connect(":memory:")
+        db.executescript(
+            """
+            CREATE TABLE messages (
+                source_email TEXT,
+                content_hash TEXT,
+                internal_date TEXT,
+                source_date_verified INTEGER,
+                last_seen_run TEXT,
+                updated_at TEXT
+            );
+            CREATE TABLE message_locations (
+                source_email TEXT,
+                content_hash TEXT,
+                source_folder TEXT,
+                source_uidvalidity INTEGER,
+                source_uid INTEGER,
+                last_seen_run TEXT,
+                updated_at TEXT
+            );
+            """
+        )
+        db.executemany(
+            "INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                ("source@example.com", "present", "2026-01-01", 1, "old", "old"),
+                ("source@example.com", "deleted", "2026-01-01", 1, "old", "old"),
+                ("source@example.com", "unverified", None, 0, "old", "old"),
+            ],
+        )
+        db.executemany(
+            "INSERT INTO message_locations VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [
+                ("source@example.com", "present", "INBOX", 9, 1, "old", "old"),
+                ("source@example.com", "deleted", "INBOX", 9, 2, "old", "old"),
+                ("source@example.com", "unverified", "INBOX", 9, 3, "old", "old"),
+            ],
+        )
+
+        verified = mail_sync.verified_known_location_uids(
+            db,
+            "source@example.com",
+            "INBOX",
+            9,
+        )
+        mail_sync.bulk_mark_locations_seen(
+            db,
+            "source@example.com",
+            "INBOX",
+            9,
+            [1],
+            "current",
+        )
+
+        self.assertEqual(verified, {1, 2})
+        locations = dict(
+            db.execute(
+                "SELECT source_uid, last_seen_run FROM message_locations"
+            ).fetchall()
+        )
+        messages = dict(
+            db.execute(
+                "SELECT content_hash, last_seen_run FROM messages"
+            ).fetchall()
+        )
+        self.assertEqual(locations, {1: "current", 2: "old", 3: "old"})
+        self.assertEqual(
+            messages,
+            {"present": "current", "deleted": "old", "unverified": "old"},
+        )
+
+    def test_source_monitor_queues_changed_folder(self):
+        changes = mail_sync.queue.Queue()
+        stop_event = self.OnePollStopEvent()
+        client = mock.Mock()
+        folder = mail_sync.FolderInfo("INBOX", "INBOX", ())
+        with (
+            mock.patch.object(mail_sync, "connect", return_value=client),
+            mock.patch.object(mail_sync, "list_folders", return_value=[folder]),
+            mock.patch.object(
+                mail_sync,
+                "mailbox_status",
+                side_effect=[(1, 10, 9), (1, 11, 10)],
+            ),
+            mock.patch.object(mail_sync, "safe_logout"),
+            mock.patch("builtins.print"),
+        ):
+            mail_sync.monitor_source_changes(
+                {"email": "source@example.com"},
+                {"email": "source@example.com"},
+                None,
+                1,
+                changes,
+                stop_event,
+            )
+
+        change = changes.get_nowait()
+        self.assertEqual(change["email"], "source@example.com")
+        self.assertEqual(change["folder"], "INBOX")
+        self.assertEqual(change["current"], (1, 11, 10))
+
+
 class AppendUidTests(unittest.TestCase):
     def test_appenduid_avoids_full_mailbox_uid_search(self):
         raw = b"Subject: append\r\n\r\nbody\r\n"

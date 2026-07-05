@@ -17,10 +17,12 @@ import io
 import json
 import os
 import poplib
+import queue
 import re
 import sqlite3
 import ssl
 import sys
+import threading
 import time
 import uuid
 import urllib.error
@@ -51,9 +53,12 @@ FLAGS_RE = re.compile(rb"FLAGS \((.*?)\)")
 UID_RE = re.compile(rb"\bUID (\d+)\b")
 RFC822_SIZE_RE = re.compile(rb"\bRFC822\.SIZE (\d+)\b")
 APPENDUID_RE = re.compile(rb"\[APPENDUID (\d+) (\d+)\]")
+STATUS_VALUE_RE = re.compile(rb"\b(UIDVALIDITY|UIDNEXT|MESSAGES)\s+(\d+)\b")
 MICROSOFT_IMAP_SCOPE = "https://outlook.office.com/IMAP.AccessAsUser.All"
 OAUTH_EXPIRY_SKEW_SECONDS = 120
 TARGET_PROFILE_KEY = "__target__"
+OAUTH_TOKEN_LOCKS: Dict[str, threading.Lock] = {}
+OAUTH_TOKEN_LOCKS_GUARD = threading.Lock()
 NO_CHANGE_ACTIONS = {
     "unchanged",
     "duplicate_location_ignored",
@@ -320,15 +325,19 @@ def microsoft_access_token(profile: dict, force_refresh: bool = False) -> str:
     auth = oauth_settings(profile)
     if auth is None:
         raise SyncError(f"OAuth is not configured for {profile['email']}")
-    token = read_oauth_token(auth)
-    expires_at = int(token.get("expires_at", 0))
-    if (
-        force_refresh
-        or not token.get("access_token")
-        or expires_at <= int(time.time()) + OAUTH_EXPIRY_SKEW_SECONDS
-    ):
-        token = refresh_microsoft_token(auth, token)
-    return str(token["access_token"])
+    token_path = str(Path(auth["token_file"]).resolve())
+    with OAUTH_TOKEN_LOCKS_GUARD:
+        token_lock = OAUTH_TOKEN_LOCKS.setdefault(token_path, threading.Lock())
+    with token_lock:
+        token = read_oauth_token(auth)
+        expires_at = int(token.get("expires_at", 0))
+        if (
+            force_refresh
+            or not token.get("access_token")
+            or expires_at <= int(time.time()) + OAUTH_EXPIRY_SKEW_SECONDS
+        ):
+            token = refresh_microsoft_token(auth, token)
+        return str(token["access_token"])
 
 
 def authenticate_oauth(client: imaplib.IMAP4, profile: dict) -> None:
@@ -473,6 +482,122 @@ def selectable_source_folders(
             continue
         selected.append(folder)
     return selected
+
+
+def parse_mailbox_status(rows: Sequence[object]) -> Tuple[int, int, int]:
+    payload = b" ".join(row for row in rows if isinstance(row, bytes))
+    values = {
+        key.decode("ascii"): int(value)
+        for key, value in STATUS_VALUE_RE.findall(payload)
+    }
+    missing = {"UIDVALIDITY", "MESSAGES"} - set(values)
+    if missing:
+        raise SyncError(
+            f"IMAP STATUS omitted values {sorted(missing)}: {payload!r}"
+        )
+    return (
+        values["UIDVALIDITY"],
+        values.get("UIDNEXT", 0),
+        values["MESSAGES"],
+    )
+
+
+def mailbox_status(
+    client: imaplib.IMAP4,
+    mailbox: str,
+) -> Tuple[int, int, int]:
+    typ, rows = client.status(
+        quote_mailbox(mailbox),
+        "(UIDVALIDITY UIDNEXT MESSAGES)",
+    )
+    if typ != "OK":
+        raise SyncError(f"IMAP STATUS failed for {mailbox}: {rows!r}")
+    return parse_mailbox_status(rows or [])
+
+
+def monitor_source_changes(
+    profile: dict,
+    source_rule: dict,
+    only_folder: Optional[str],
+    poll_interval: float,
+    changes: "queue.Queue[dict]",
+    stop_event: threading.Event,
+) -> None:
+    email = source_rule["email"]
+    reconnect_delay = max(2.0, poll_interval)
+    while not stop_event.is_set():
+        client: Optional[imaplib.IMAP4] = None
+        try:
+            client = connect(profile)
+            folders = selectable_source_folders(
+                list_folders(client),
+                source_rule,
+            )
+            if only_folder:
+                folders = [
+                    folder
+                    for folder in folders
+                    if only_folder in (folder.raw_name, folder.display_name)
+                ]
+            snapshots = {
+                folder.raw_name: mailbox_status(client, folder.raw_name)
+                for folder in folders
+            }
+            print(
+                json.dumps(
+                    {
+                        "event": "source_monitor_ready",
+                        "source": email,
+                        "folders": len(folders),
+                        "poll_interval": poll_interval,
+                        "time": now_iso(),
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+            while not stop_event.wait(poll_interval):
+                for folder in folders:
+                    current = mailbox_status(client, folder.raw_name)
+                    previous = snapshots[folder.raw_name]
+                    if current == previous:
+                        continue
+                    snapshots[folder.raw_name] = current
+                    changes.put(
+                        {
+                            "email": email,
+                            "folder": folder.raw_name,
+                            "uidvalidity_changed": current[0] != previous[0],
+                            "previous": previous,
+                            "current": current,
+                        }
+                    )
+        except (
+            SyncError,
+            imaplib.IMAP4.error,
+            OSError,
+            ValueError,
+            EOFError,
+        ) as exc:
+            if not stop_event.is_set():
+                print(
+                    json.dumps(
+                        {
+                            "event": "source_monitor_reconnecting",
+                            "source": email,
+                            "error": str(exc),
+                            "seconds": reconnect_delay,
+                            "time": now_iso(),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    file=sys.stderr,
+                    flush=True,
+                )
+        finally:
+            if client is not None:
+                safe_logout(client)
+        stop_event.wait(reconnect_delay)
 
 
 def response_int(client: imaplib.IMAP4, name: str) -> int:
@@ -2360,6 +2485,119 @@ def command_list_folders(
     return 0
 
 
+def incremental_candidate_uids(
+    db: sqlite3.Connection,
+    source_email: str,
+    source_folder: str,
+    source_uidvalidity: int,
+    source_uids: Sequence[int],
+) -> List[int]:
+    known_uids = {
+        int(row[0])
+        for row in db.execute(
+            """
+            SELECT source_uid
+            FROM message_locations
+            WHERE source_email=? AND source_folder=?
+              AND source_uidvalidity=?
+            """,
+            (source_email, source_folder, source_uidvalidity),
+        ).fetchall()
+    }
+    return [uid for uid in source_uids if uid not in known_uids]
+
+
+def verified_known_location_uids(
+    db: sqlite3.Connection,
+    source_email: str,
+    source_folder: str,
+    source_uidvalidity: int,
+) -> Set[int]:
+    return {
+        int(row[0])
+        for row in db.execute(
+            """
+            SELECT locations.source_uid
+            FROM message_locations AS locations
+            JOIN messages
+              ON messages.source_email=locations.source_email
+             AND messages.content_hash=locations.content_hash
+            WHERE locations.source_email=?
+              AND locations.source_folder=?
+              AND locations.source_uidvalidity=?
+              AND messages.internal_date IS NOT NULL
+              AND messages.source_date_verified=1
+            """,
+            (source_email, source_folder, source_uidvalidity),
+        ).fetchall()
+    }
+
+
+def bulk_mark_locations_seen(
+    db: sqlite3.Connection,
+    source_email: str,
+    source_folder: str,
+    source_uidvalidity: int,
+    source_uids: Sequence[int],
+    run_id: str,
+) -> None:
+    if not source_uids:
+        return
+    updated_at = now_iso()
+    db.execute(
+        """
+        CREATE TEMP TABLE IF NOT EXISTS current_folder_uids (
+            source_uid INTEGER PRIMARY KEY
+        )
+        """
+    )
+    db.execute("DELETE FROM current_folder_uids")
+    db.executemany(
+        "INSERT OR IGNORE INTO current_folder_uids(source_uid) VALUES (?)",
+        ((uid,) for uid in source_uids),
+    )
+    db.execute(
+        """
+        UPDATE message_locations
+        SET last_seen_run=?, updated_at=?
+        WHERE source_email=? AND source_folder=?
+          AND source_uidvalidity=?
+          AND source_uid IN (SELECT source_uid FROM current_folder_uids)
+        """,
+        (
+            run_id,
+            updated_at,
+            source_email,
+            source_folder,
+            source_uidvalidity,
+        ),
+    )
+    db.execute(
+        """
+        UPDATE messages
+        SET last_seen_run=?, updated_at=?
+        WHERE source_email=?
+          AND content_hash IN (
+              SELECT content_hash
+              FROM message_locations
+              WHERE source_email=? AND source_folder=?
+                AND source_uidvalidity=?
+                AND source_uid IN (
+                    SELECT source_uid FROM current_folder_uids
+                )
+          )
+        """,
+        (
+            run_id,
+            updated_at,
+            source_email,
+            source_email,
+            source_folder,
+            source_uidvalidity,
+        ),
+    )
+
+
 def command_sync(
     config: dict,
     profiles: Dict[str, dict],
@@ -2369,7 +2607,10 @@ def command_sync(
     only_folder: Optional[str],
     limit: Optional[int],
     newest_first: bool,
+    incremental_only: bool = False,
 ) -> int:
+    if incremental_only and only_folder is None:
+        raise SyncError("Fast incremental sync requires one source folder")
     db = init_db(state_path)
     target_rule = config["target"]
     target_profile = profiles[TARGET_PROFILE_KEY]
@@ -2412,12 +2653,48 @@ def command_sync(
                         readonly=True,
                     )
                     uids = search_uids(source)
+                    if incremental_only:
+                        uids = incremental_candidate_uids(
+                            db,
+                            email,
+                            folder.raw_name,
+                            uidvalidity,
+                            uids,
+                        )
                     skipped_uids = source_folder_skipped_uids(rule, folder)
                     inspect_deleted_drafts = (
                         rule.get("skip_deleted_drafts", False)
                         and source_folder_label(rule, folder)
                         == rule.get("deleted_label")
                     )
+                    if not incremental_only and not inspect_deleted_drafts:
+                        verified_uids = verified_known_location_uids(
+                            db,
+                            email,
+                            folder.raw_name,
+                            uidvalidity,
+                        )
+                        unchanged_uids = [
+                            uid for uid in uids if uid in verified_uids
+                        ]
+                        if unchanged_uids:
+                            bulk_mark_locations_seen(
+                                db,
+                                email,
+                                folder.raw_name,
+                                uidvalidity,
+                                unchanged_uids,
+                                run_id,
+                            )
+                            unchanged_count = len(unchanged_uids)
+                            summary["unchanged"] = (
+                                summary.get("unchanged", 0)
+                                + unchanged_count
+                            )
+                            total_scanned += unchanged_count
+                            uids = [
+                                uid for uid in uids if uid not in verified_uids
+                            ]
                     if newest_first:
                         uids.reverse()
                     for uid in uids:
@@ -2897,6 +3174,7 @@ def command_watch(
     limit: Optional[int],
     newest_first: bool,
     interval: int,
+    poll_interval: float,
     max_cycles: Optional[int],
 ) -> int:
     rules = selected_source_rules(config, source_email)
@@ -2930,76 +3208,185 @@ def command_watch(
                 f"batch_size for {rule['email']} must be at least 1"
             )
 
-    cycle = 0
-    while True:
-        job = min(schedule, key=lambda item: item["next_run"])
-        delay = job["next_run"] - time.monotonic()
-        if delay > 0:
-            time.sleep(delay)
-
-        cycle += 1
-        print(
-            json.dumps(
-                {
-                    "event": "source_sync_started",
-                    "cycle": cycle,
-                    "source": job["email"],
-                    "interval": job["interval"],
-                    "batch_size": job["batch_size"],
-                    "time": now_iso(),
-                },
-                ensure_ascii=False,
-            ),
-            flush=True,
-        )
-        try:
-            command_sync(
-                config,
-                profiles,
-                labels_by_name,
-                state_path,
-                job["email"],
-                only_folder,
-                limit if limit is not None else job["batch_size"],
-                newest_first,
+    changes: "queue.Queue[dict]" = queue.Queue()
+    stop_event = threading.Event()
+    monitors = []
+    if poll_interval > 0:
+        for rule in rules:
+            monitor = threading.Thread(
+                target=monitor_source_changes,
+                args=(
+                    profiles[rule["email"]],
+                    rule,
+                    only_folder,
+                    poll_interval,
+                    changes,
+                    stop_event,
+                ),
+                name=f"mail-monitor-{rule['email']}",
+                daemon=True,
             )
-            success = True
-        except (SyncError, imaplib.IMAP4.error, OSError, ValueError) as exc:
-            success = False
+            monitor.start()
+            monitors.append(monitor)
+
+    cycle = 0
+    pending_changes: Dict[Tuple[str, str], dict] = {}
+    try:
+        while True:
+            full_job = min(schedule, key=lambda item: item["next_run"])
+            timeout = max(
+                0.0,
+                min(1.0, full_job["next_run"] - time.monotonic()),
+            )
+            try:
+                change = changes.get(timeout=timeout)
+                pending_changes[(change["email"], change["folder"])] = change
+                while True:
+                    change = changes.get_nowait()
+                    pending_changes[(change["email"], change["folder"])] = change
+            except queue.Empty:
+                pass
+
+            if pending_changes:
+                _, change = pending_changes.popitem()
+                cycle += 1
+                print(
+                    json.dumps(
+                        {
+                            "event": "source_change_detected",
+                            "cycle": cycle,
+                            "source": change["email"],
+                            "folder": change["folder"],
+                            "previous": change["previous"],
+                            "current": change["current"],
+                            "time": now_iso(),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
+                try:
+                    command_sync(
+                        config,
+                        profiles,
+                        labels_by_name,
+                        state_path,
+                        change["email"],
+                        (
+                            None
+                            if change["uidvalidity_changed"]
+                            else change["folder"]
+                        ),
+                        None,
+                        True,
+                        incremental_only=not change["uidvalidity_changed"],
+                    )
+                    success = True
+                except (
+                    SyncError,
+                    imaplib.IMAP4.error,
+                    OSError,
+                    ValueError,
+                ) as exc:
+                    success = False
+                    print(
+                        json.dumps(
+                            {
+                                "event": "source_incremental_sync_failed",
+                                "cycle": cycle,
+                                "source": change["email"],
+                                "folder": change["folder"],
+                                "time": now_iso(),
+                                "error": str(exc),
+                            },
+                            ensure_ascii=False,
+                        ),
+                        file=sys.stderr,
+                        flush=True,
+                    )
+            else:
+                full_job = min(schedule, key=lambda item: item["next_run"])
+                if full_job["next_run"] > time.monotonic():
+                    continue
+                cycle += 1
+                print(
+                    json.dumps(
+                        {
+                            "event": "source_sync_started",
+                            "cycle": cycle,
+                            "source": full_job["email"],
+                            "interval": full_job["interval"],
+                            "batch_size": full_job["batch_size"],
+                            "time": now_iso(),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
+                try:
+                    command_sync(
+                        config,
+                        profiles,
+                        labels_by_name,
+                        state_path,
+                        full_job["email"],
+                        only_folder,
+                        (
+                            limit
+                            if limit is not None
+                            else full_job["batch_size"]
+                        ),
+                        newest_first,
+                    )
+                    success = True
+                except (
+                    SyncError,
+                    imaplib.IMAP4.error,
+                    OSError,
+                    ValueError,
+                ) as exc:
+                    success = False
+                    print(
+                        json.dumps(
+                            {
+                                "event": "source_sync_failed",
+                                "cycle": cycle,
+                                "source": full_job["email"],
+                                "time": now_iso(),
+                                "error": str(exc),
+                            },
+                            ensure_ascii=False,
+                        ),
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                full_job["next_run"] = time.monotonic() + full_job["interval"]
+
+            if max_cycles is not None and cycle >= max_cycles:
+                return 0 if success else 1
+
+            next_job = min(schedule, key=lambda item: item["next_run"])
             print(
                 json.dumps(
                     {
-                        "event": "source_sync_failed",
-                        "cycle": cycle,
-                        "source": job["email"],
-                        "time": now_iso(),
-                        "error": str(exc),
+                        "event": "next_source_sync_scheduled",
+                        "source": next_job["email"],
+                        "seconds": round(
+                            max(
+                                0.0,
+                                next_job["next_run"] - time.monotonic(),
+                            ),
+                            3,
+                        ),
                     },
                     ensure_ascii=False,
                 ),
-                file=sys.stderr,
                 flush=True,
             )
-
-        if max_cycles is not None and cycle >= max_cycles:
-            return 0 if success else 1
-
-        job["next_run"] = time.monotonic() + job["interval"]
-        next_job = min(schedule, key=lambda item: item["next_run"])
-        print(
-            json.dumps(
-                {
-                    "event": "next_source_sync_scheduled",
-                    "source": next_job["email"],
-                    "seconds": round(
-                        max(0.0, next_job["next_run"] - time.monotonic()),
-                        3,
-                    ),
-                },
-                ensure_ascii=False,
-            ),
-            flush=True,
-        )
+    finally:
+        stop_event.set()
+        for monitor in monitors:
+            monitor.join(timeout=2)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -3069,7 +3456,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--interval",
         type=int,
         default=int(os.environ.get("SYNC_INTERVAL", "60")),
-        help="Seconds between cycle start times (default: SYNC_INTERVAL or 60)",
+        help="Seconds between full reconciliation scans (default: 60)",
+    )
+    watch_parser.add_argument(
+        "--poll-interval",
+        type=float,
+        default=float(os.environ.get("SYNC_POLL_INTERVAL", "3")),
+        help="Seconds between lightweight concurrent mailbox checks (default: 3)",
     )
     watch_parser.add_argument(
         "--max-cycles",
@@ -3127,6 +3520,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.command == "watch":
         if args.interval < 1:
             raise SyncError("--interval must be at least 1 second")
+        if args.poll_interval < 0:
+            raise SyncError("--poll-interval cannot be negative")
         if args.max_cycles is not None and args.max_cycles < 1:
             raise SyncError("--max-cycles must be positive")
         with process_lock(state_path):
@@ -3140,6 +3535,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 args.limit,
                 args.newest_first,
                 args.interval,
+                args.poll_interval,
                 args.max_cycles,
             )
     raise SyncError(f"Unsupported command: {args.command}")
