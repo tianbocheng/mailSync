@@ -3,6 +3,7 @@ import tempfile
 import time
 import unittest
 from datetime import datetime, timezone
+from email.header import Header
 from pathlib import Path
 from unittest import mock
 
@@ -10,6 +11,59 @@ import mail_sync
 
 
 class MessageDateTests(unittest.TestCase):
+    def test_lightweight_metadata_fetch_is_batched_and_parsed(self):
+        client = mock.Mock()
+        client.uid.return_value = (
+            "OK",
+            [
+                (
+                    b'1 (UID 9 INTERNALDATE "10-Nov-2020 15:44:03 +0800" '
+                    b"FLAGS (\\Seen))",
+                    None,
+                )
+            ],
+        )
+
+        result = mail_sync.fetch_message_metadata(client, [9])
+
+        self.assertEqual(
+            result[9],
+            (
+                datetime.fromisoformat("2020-11-10T15:44:03+08:00"),
+                ("\\Seen",),
+            ),
+        )
+
+    def test_new_state_database_marks_existing_dates_unverified(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = mail_sync.init_db(Path(directory) / "state.sqlite3")
+            try:
+                columns = {
+                    row[1]
+                    for row in db.execute(
+                        "PRAGMA table_info(messages)"
+                    ).fetchall()
+                }
+            finally:
+                db.close()
+
+        self.assertIn("source_date_verified", columns)
+
+    def test_split_fetch_response_preserves_trailing_internal_date_and_flags(self):
+        rows = [
+            (b"25 (UID 5408 BODY[] {4}", b"body"),
+            b' INTERNALDATE "10-Nov-2020 15:44:03 +0800" FLAGS (\\Seen))',
+        ]
+
+        metadata, raw = mail_sync.parse_fetch_tuple(rows)
+
+        self.assertEqual(raw, b"body")
+        self.assertEqual(
+            mail_sync.parse_internal_date(metadata),
+            datetime.fromisoformat("2020-11-10T15:44:03+08:00"),
+        )
+        self.assertEqual(mail_sync.parse_flags(metadata), ("\\Seen",))
+
     def test_internal_date_takes_precedence_over_date_header(self):
         metadata = b'1 (INTERNALDATE "01-Jun-2026 09:38:23 +0800")'
         raw = b"Date: Mon, 8 May 2023 15:05:39 +0800\r\n\r\nbody\r\n"
@@ -42,6 +96,23 @@ class MessageDateTests(unittest.TestCase):
     def test_invalid_date_header_returns_none(self):
         self.assertIsNone(
             mail_sync.parse_message_date(b"Date: definitely-not-a-date\r\n\r\n")
+        )
+
+    def test_header_object_date_is_converted_to_string(self):
+        parsed_message = mock.Mock()
+        parsed_message.get.return_value = Header(
+            "Mon, 8 May 2023 15:05:39 +0800"
+        )
+        with mock.patch.object(
+            mail_sync,
+            "message_from_bytes",
+            return_value=parsed_message,
+        ):
+            result = mail_sync.parse_message_date(b"ignored")
+
+        self.assertEqual(
+            result,
+            datetime.fromisoformat("2023-05-08T15:05:39+08:00"),
         )
 
 
@@ -318,6 +389,31 @@ class SourceFetchTests(unittest.TestCase):
             len(raw),
         )
 
+    def test_missing_pop_fallback_headers_is_skipped(self):
+        client = mock.Mock()
+        client.uid.side_effect = [
+            ("OK", [None]),
+            ("OK", [b"9 (UID 9 RFC822.SIZE 123)"]),
+        ]
+        profile = {
+            "email": "source@example.com",
+            "password": "secret",
+            "pop_fallback": {"server": "pop.example.com"},
+        }
+
+        with self.assertRaisesRegex(
+            mail_sync.SourceMessageUnavailable,
+            "UID 9",
+        ):
+            mail_sync.fetch_source_message(
+                client,
+                "source@example.com",
+                "INBOX",
+                123,
+                9,
+                profile,
+            )
+
     def test_pop_stream_unstuffs_dot_lines(self):
         client = mock.Mock()
         client._getline.side_effect = [
@@ -337,6 +433,58 @@ class SourceRuleTests(unittest.TestCase):
         self.assertEqual(
             mail_sync.source_folder_skipped_uids(rule, folder),
             {1761199015, 1761199014},
+        )
+
+    def test_outlook_deleted_draft_without_delivery_headers_is_skipped(self):
+        folder = mail_sync.FolderInfo("Deleted", "Deleted", (r"\Trash",))
+        rule = {
+            "skip_deleted_drafts": True,
+            "folder_labels": {"Deleted": "BOX:已删除邮件"},
+            "default_folder_label": "BOX:其他文件夹",
+            "deleted_label": "BOX:已删除邮件",
+        }
+        message = mail_sync.SourceMessage(
+            source_email="user@outlook.com",
+            folder="Deleted",
+            uidvalidity=1,
+            uid=2,
+            raw=b"From: a@example.com\r\nTo: b@example.com\r\nSubject: draft\r\n\r\n",
+            content_hash="hash",
+            message_id=None,
+            internal_date=datetime.now(timezone.utc),
+            system_flags=(),
+        )
+
+        self.assertTrue(
+            mail_sync.is_deleted_draft_message(rule, folder, message)
+        )
+
+    def test_outlook_normal_deleted_message_is_not_skipped(self):
+        folder = mail_sync.FolderInfo("Deleted", "Deleted", (r"\Trash",))
+        rule = {
+            "skip_deleted_drafts": True,
+            "folder_labels": {"Deleted": "BOX:已删除邮件"},
+            "default_folder_label": "BOX:其他文件夹",
+            "deleted_label": "BOX:已删除邮件",
+        }
+        message = mail_sync.SourceMessage(
+            source_email="user@outlook.com",
+            folder="Deleted",
+            uidvalidity=1,
+            uid=3,
+            raw=(
+                b"Message-ID: <normal@example.com>\r\n"
+                b"Date: Mon, 8 May 2023 15:05:39 +0800\r\n"
+                b"From: a@example.com\r\nTo: b@example.com\r\n\r\n"
+            ),
+            content_hash="hash",
+            message_id="<normal@example.com>",
+            internal_date=datetime.now(timezone.utc),
+            system_flags=(),
+        )
+
+        self.assertFalse(
+            mail_sync.is_deleted_draft_message(rule, folder, message)
         )
 
 
@@ -579,8 +727,8 @@ class PendingMultiLabelTests(unittest.TestCase):
                 ),
                 mock.patch.object(
                     mail_sync,
-                    "search_uids",
-                    return_value=[30],
+                    "response_int",
+                    return_value=31,
                 ),
             ):
                 mail_sync.begin_pending_operation(
@@ -602,6 +750,58 @@ class PendingMultiLabelTests(unittest.TestCase):
             )
             self.assertEqual(row["folder_label"], "BOX:收件箱")
             db.close()
+
+
+class AppendUidTests(unittest.TestCase):
+    def test_appenduid_avoids_full_mailbox_uid_search(self):
+        raw = b"Subject: append\r\n\r\nbody\r\n"
+        message = mail_sync.SourceMessage(
+            source_email="source@example.com",
+            folder="INBOX",
+            uidvalidity=1,
+            uid=2,
+            raw=raw,
+            content_hash=mail_sync.hashlib.sha256(raw).hexdigest(),
+            message_id=None,
+            internal_date=datetime.now(timezone.utc),
+            system_flags=(),
+        )
+        client = mock.Mock()
+        client.append.return_value = (
+            "OK",
+            [b"[APPENDUID 20 31] APPEND completed"],
+        )
+        client.uid.return_value = ("OK", [b"stored"])
+        with (
+            mock.patch.object(
+                mail_sync,
+                "select_mailbox",
+                return_value=(10, 20),
+            ),
+            mock.patch.object(
+                mail_sync,
+                "response_int",
+                return_value=31,
+            ),
+            mock.patch.object(
+                mail_sync,
+                "target_fetch",
+                return_value=(
+                    b"31 (UID 31 FLAGS ($account $folder))",
+                    raw,
+                ),
+            ),
+            mock.patch.object(mail_sync, "search_uids") as search,
+        ):
+            result = mail_sync.append_target_copy(
+                client,
+                "INBOX",
+                message,
+                ("$account", "$folder"),
+            )
+
+        self.assertEqual(result, (20, 31))
+        search.assert_not_called()
 
 
 if __name__ == "__main__":

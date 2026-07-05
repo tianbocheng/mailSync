@@ -1,5 +1,5 @@
 {
-  "state_db": "mail_sync_state.sqlite3",
+  "state_db": "data/mail_sync_state.sqlite3",
   "target": {
     "email": "tianbocheng@lantian2019.cn",
     "password": "CHANGE_ME",
@@ -60,6 +60,7 @@
         ]
       },
       "account_label": "SYNC:your-account@outlook.com",
+      "skip_deleted_drafts": true,
       "exclude_folders": ["Drafts"],
       "folder_labels": {
         "INBOX": "BOX:收件箱",

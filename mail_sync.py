@@ -50,6 +50,7 @@ INTERNALDATE_RE = re.compile(rb'INTERNALDATE "([^"]+)"')
 FLAGS_RE = re.compile(rb"FLAGS \((.*?)\)")
 UID_RE = re.compile(rb"\bUID (\d+)\b")
 RFC822_SIZE_RE = re.compile(rb"\bRFC822\.SIZE (\d+)\b")
+APPENDUID_RE = re.compile(rb"\[APPENDUID (\d+) (\d+)\]")
 MICROSOFT_IMAP_SCOPE = "https://outlook.office.com/IMAP.AccessAsUser.All"
 OAUTH_EXPIRY_SKEW_SECONDS = 120
 TARGET_PROFILE_KEY = "__target__"
@@ -488,10 +489,51 @@ def response_int(client: imaplib.IMAP4, name: str) -> int:
 
 
 def parse_fetch_tuple(rows: Sequence[object]) -> Tuple[bytes, bytes]:
+    metadata_parts = []
+    body = None
     for row in rows:
         if isinstance(row, tuple) and len(row) == 2:
-            return row[0], row[1]
-    raise SyncError("IMAP FETCH did not return a message body")
+            if isinstance(row[0], bytes):
+                metadata_parts.append(row[0])
+            if body is None and isinstance(row[1], bytes):
+                body = row[1]
+        elif isinstance(row, bytes):
+            # Some IMAP servers return attributes following a BODY literal
+            # (notably INTERNALDATE and FLAGS) as a separate response item.
+            metadata_parts.append(row)
+    if body is None:
+        raise SyncError("IMAP FETCH did not return a message body")
+    return b" ".join(metadata_parts), body
+
+
+def fetch_message_metadata(
+    client: imaplib.IMAP4,
+    uids: Sequence[int],
+) -> Dict[int, Tuple[Optional[datetime], Tuple[str, ...]]]:
+    """Fetch lightweight source metadata without downloading message bodies."""
+    results: Dict[int, Tuple[Optional[datetime], Tuple[str, ...]]] = {}
+    for offset in range(0, len(uids), 200):
+        batch = uids[offset : offset + 200]
+        if not batch:
+            continue
+        typ, rows = client.uid(
+            "fetch",
+            ",".join(str(uid) for uid in batch),
+            "(UID INTERNALDATE FLAGS)",
+        )
+        if typ != "OK":
+            raise SyncError("IMAP metadata FETCH failed")
+        for row in rows or []:
+            metadata = row[0] if isinstance(row, tuple) else row
+            if not isinstance(metadata, bytes):
+                continue
+            uid_match = UID_RE.search(metadata)
+            if uid_match:
+                results[int(uid_match.group(1))] = (
+                    parse_internal_date(metadata),
+                    parse_flags(metadata),
+                )
+    return results
 
 
 def parse_internal_date(metadata: bytes) -> Optional[datetime]:
@@ -510,8 +552,10 @@ def parse_message_date(raw: bytes) -> Optional[datetime]:
     if not value:
         return None
     try:
-        parsed = parsedate_to_datetime(value)
-    except (TypeError, ValueError, OverflowError):
+        # Compat32 can return email.header.Header for malformed or programmatically
+        # constructed messages; parsedate_to_datetime requires a string.
+        parsed = parsedate_to_datetime(str(value))
+    except (AttributeError, TypeError, ValueError, OverflowError):
         return None
     if parsed is None:
         return None
@@ -681,7 +725,13 @@ def fetch_source_message(
                 f"Header FETCH failed for POP fallback: "
                 f"{source_email} {folder} UID {uid}"
             )
-        header_metadata, header = parse_fetch_tuple(header_rows or [])
+        try:
+            header_metadata, header = parse_fetch_tuple(header_rows or [])
+        except SyncError as exc:
+            raise SourceMessageUnavailable(
+                f"Source message has no fetchable body or headers: "
+                f"{source_email} {folder} UID {uid}"
+            ) from exc
         parsed_header = message_from_bytes(header)
         message_id = parsed_header.get("Message-ID", "").strip()
         size_match = RFC822_SIZE_RE.search(header_metadata)
@@ -743,6 +793,7 @@ def init_db(path: Path) -> sqlite3.Connection:
             source_uid INTEGER NOT NULL,
             source_flags TEXT NOT NULL,
             internal_date TEXT,
+            source_date_verified INTEGER NOT NULL DEFAULT 0,
             target_uidvalidity INTEGER NOT NULL,
             target_uid INTEGER NOT NULL,
             account_label TEXT NOT NULL,
@@ -810,6 +861,11 @@ def init_db(path: Path) -> sqlite3.Connection:
     if "folder_labels_json" not in columns:
         connection.execute(
             "ALTER TABLE messages ADD COLUMN folder_labels_json TEXT"
+        )
+    if "source_date_verified" not in columns:
+        connection.execute(
+            "ALTER TABLE messages ADD COLUMN "
+            "source_date_verified INTEGER NOT NULL DEFAULT 0"
         )
     pending_columns = {
         row[1]
@@ -964,6 +1020,63 @@ def source_folder_skipped_uids(
         ) from exc
 
 
+def is_deleted_draft_message(
+    source_rule: dict,
+    folder: FolderInfo,
+    message: SourceMessage,
+) -> bool:
+    """Identify unsent drafts that Outlook moves into its Deleted folder."""
+    if not source_rule.get("skip_deleted_drafts", False):
+        return False
+    if source_folder_label(source_rule, folder) != source_rule.get("deleted_label"):
+        return False
+    if r"\Draft" in message.system_flags:
+        return True
+    parsed = message_from_bytes(message.raw)
+    return not any(
+        (
+            parsed.get("Message-ID"),
+            parsed.get("Date"),
+            parsed.get_all("Received"),
+        )
+    )
+
+
+def purge_single_location_message(
+    db: sqlite3.Connection,
+    target: imaplib.IMAP4,
+    target_folder: str,
+    existing: sqlite3.Row,
+) -> bool:
+    """Remove an already-synced message when its sole source location is skipped."""
+    location_count = db.execute(
+        """
+        SELECT COUNT(*) FROM message_locations
+        WHERE source_email=? AND content_hash=?
+        """,
+        (existing["source_email"], existing["content_hash"]),
+    ).fetchone()[0]
+    if location_count != 1:
+        return False
+    delete_target_copy(target, target_folder, int(existing["target_uid"]))
+    db.execute(
+        """
+        DELETE FROM message_locations
+        WHERE source_email=? AND content_hash=?
+        """,
+        (existing["source_email"], existing["content_hash"]),
+    )
+    db.execute(
+        """
+        DELETE FROM messages
+        WHERE source_email=? AND content_hash=?
+        """,
+        (existing["source_email"], existing["content_hash"]),
+    )
+    db.commit()
+    return True
+
+
 def format_flag_list(flags: Iterable[str]) -> str:
     return "(" + " ".join(sorted(set(flags))) + ")"
 
@@ -993,7 +1106,7 @@ def append_target_copy(
     label_ids: Sequence[str],
 ) -> Tuple[int, int]:
     _, uidvalidity = select_mailbox(client, target_folder, readonly=False)
-    before = set(search_uids(client))
+    first_possible_uid = response_int(client, "UIDNEXT")
     system_flags = format_flag_list(message.system_flags)
     typ, response = client.append(
         quote_mailbox(target_folder),
@@ -1003,8 +1116,20 @@ def append_target_copy(
     )
     if typ != "OK":
         raise SyncError(f"APPEND failed: {response!r}")
-    after = set(search_uids(client))
-    created = sorted(after - before)
+    response_bytes = b" ".join(
+        value for value in (response or []) if isinstance(value, bytes)
+    )
+    append_uid = APPENDUID_RE.search(response_bytes)
+    if append_uid:
+        appended_uidvalidity = int(append_uid.group(1))
+        if appended_uidvalidity != uidvalidity:
+            raise SyncError(
+                f"APPENDUID UIDVALIDITY changed: expected {uidvalidity}, "
+                f"received {appended_uidvalidity}"
+            )
+        created = [int(append_uid.group(2))]
+    else:
+        created = search_uids(client, f"UID {first_possible_uid}:*")
     if len(created) != 1:
         raise SyncError(f"Expected one appended UID, found {created}")
     uid = created[0]
@@ -1051,8 +1176,7 @@ def delete_target_copy(
 ) -> None:
     select_mailbox(client, target_folder, readonly=False)
     ensure_no_preexisting_deleted(client, old_uid)
-    existing = set(search_uids(client))
-    if old_uid not in existing:
+    if old_uid not in set(search_uids(client, f"UID {old_uid}")):
         return
     typ, response = client.uid(
         "store",
@@ -1131,8 +1255,7 @@ def begin_pending_operation(
             f"Location label {primary_folder_label} is not in desired labels"
         )
     _, target_uidvalidity = select_mailbox(target, target_folder, readonly=False)
-    target_uids = search_uids(target)
-    target_uid_before = max(target_uids, default=0)
+    target_uid_before = max(0, response_int(target, "UIDNEXT") - 1)
     timestamp = now_iso()
     db.execute(
         """
@@ -1532,9 +1655,10 @@ def upsert_state(
         INSERT INTO messages (
             source_email, content_hash, normalized_hash, message_id, source_folder,
             source_uidvalidity, source_uid, source_flags, internal_date,
+            source_date_verified,
             target_uidvalidity, target_uid, account_label, folder_label,
             folder_labels_json, last_seen_run, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(source_email, content_hash) DO UPDATE SET
             normalized_hash=excluded.normalized_hash,
             message_id=excluded.message_id,
@@ -1543,6 +1667,7 @@ def upsert_state(
             source_uid=excluded.source_uid,
             source_flags=excluded.source_flags,
             internal_date=excluded.internal_date,
+            source_date_verified=1,
             target_uidvalidity=excluded.target_uidvalidity,
             target_uid=excluded.target_uid,
             account_label=excluded.account_label,
@@ -1647,6 +1772,7 @@ def sync_message(
     folder_label_name: str,
     labels_by_name: Dict[str, str],
     run_id: str,
+    force_rebuild: bool = False,
 ) -> str:
     try:
         account_label_id = labels_by_name[account_label_name]
@@ -1695,7 +1821,7 @@ def sync_message(
         ):
             old_target_uid = int(existing["target_uid"])
             action = "rebuilt"
-        elif stored_internal_date != message.internal_date:
+        elif force_rebuild or stored_internal_date != message.internal_date:
             # Some IMAP servers omit INTERNALDATE. Older versions then APPENDed
             # with no date, causing the target to assign the current year.
             old_target_uid = int(existing["target_uid"])
@@ -2182,6 +2308,11 @@ def command_sync(
                     )
                     uids = search_uids(source)
                     skipped_uids = source_folder_skipped_uids(rule, folder)
+                    inspect_deleted_drafts = (
+                        rule.get("skip_deleted_drafts", False)
+                        and source_folder_label(rule, folder)
+                        == rule.get("deleted_label")
+                    )
                     if newest_first:
                         uids.reverse()
                     for uid in uids:
@@ -2192,7 +2323,12 @@ def command_sync(
                             uidvalidity,
                             uid,
                         )
-                        if known is not None and known["internal_date"] is not None:
+                        if (
+                            known is not None
+                            and known["internal_date"] is not None
+                            and known["source_date_verified"]
+                            and not inspect_deleted_drafts
+                        ):
                             db.execute(
                                 """
                                 UPDATE message_locations
@@ -2264,6 +2400,39 @@ def command_sync(
                                             "folder": folder.display_name,
                                             "uid": uid,
                                             "reason": str(exc),
+                                        },
+                                        ensure_ascii=False,
+                                    ),
+                                    flush=True,
+                                )
+                                continue
+                            if is_deleted_draft_message(rule, folder, message):
+                                purged = (
+                                    known is not None
+                                    and purge_single_location_message(
+                                        db,
+                                        target,
+                                        target_rule["folder"],
+                                        known,
+                                    )
+                                )
+                                action = (
+                                    "source_deleted_draft_purged"
+                                    if purged
+                                    else "source_deleted_draft_skipped"
+                                )
+                                if purged:
+                                    source_changed += 1
+                                    total_changed += 1
+                                summary[action] = summary.get(action, 0) + 1
+                                total_scanned += 1
+                                print(
+                                    json.dumps(
+                                        {
+                                            "event": action,
+                                            "source": email,
+                                            "folder": folder.display_name,
+                                            "uid": uid,
                                         },
                                         ensure_ascii=False,
                                     ),
@@ -2350,6 +2519,223 @@ def command_sync(
         finally:
             db.close()
     return 0
+
+
+def command_repair_dates(
+    config: dict,
+    profiles: Dict[str, dict],
+    labels_by_name: Dict[str, str],
+    state_path: Path,
+    source_email: Optional[str],
+) -> int:
+    """Verify stored dates against source INTERNALDATE and rebuild mismatches."""
+    db = init_db(state_path)
+    target_rule = config["target"]
+    target = connect(profiles[TARGET_PROFILE_KEY])
+    run_id = uuid.uuid4().hex
+    totals = {
+        "verified": 0,
+        "date_rebuilt": 0,
+        "unresolved": 0,
+    }
+    try:
+        recover_pending_operations(
+            db,
+            target,
+            target_rule["folder"],
+            labels_by_name,
+        )
+        for rule in selected_source_rules(config, source_email):
+            email = rule["email"]
+            source = connect(profiles[email])
+            account_verified = 0
+            account_rebuilt = 0
+            try:
+                folders = {
+                    folder.raw_name: folder
+                    for folder in selectable_source_folders(
+                        list_folders(source),
+                        rule,
+                    )
+                }
+                rows = db.execute(
+                    """
+                    SELECT * FROM messages
+                    WHERE source_email=? AND source_date_verified=0
+                      AND source_folder<>'__deleted__'
+                    ORDER BY source_folder, source_uidvalidity, source_uid
+                    """,
+                    (email,),
+                ).fetchall()
+                select_mailbox(
+                    target,
+                    target_rule["folder"],
+                    readonly=True,
+                )
+                target_metadata = fetch_message_metadata(
+                    target,
+                    [int(row["target_uid"]) for row in rows],
+                )
+                rows_by_folder: Dict[Tuple[str, int], List[sqlite3.Row]] = {}
+                for row in rows:
+                    key = (
+                        row["source_folder"],
+                        int(row["source_uidvalidity"]),
+                    )
+                    rows_by_folder.setdefault(key, []).append(row)
+
+                for (folder_name, expected_uidvalidity), folder_rows in (
+                    rows_by_folder.items()
+                ):
+                    folder = folders.get(folder_name)
+                    if folder is None:
+                        totals["unresolved"] += len(folder_rows)
+                        continue
+                    _, uidvalidity = select_mailbox(
+                        source,
+                        folder_name,
+                        readonly=True,
+                    )
+                    if uidvalidity != expected_uidvalidity:
+                        raise SyncError(
+                            f"Source UIDVALIDITY changed during date repair: "
+                            f"{email} {folder_name}"
+                        )
+                    metadata = fetch_message_metadata(
+                        source,
+                        [int(row["source_uid"]) for row in folder_rows],
+                    )
+                    for row in folder_rows:
+                        uid = int(row["source_uid"])
+                        current = metadata.get(uid)
+                        if current is None:
+                            totals["unresolved"] += 1
+                            continue
+                        source_date, _ = current
+                        target_date = target_metadata.get(
+                            int(row["target_uid"]),
+                            (None, ()),
+                        )[0]
+                        stored_date = (
+                            datetime.fromisoformat(row["internal_date"])
+                            if row["internal_date"]
+                            else None
+                        )
+                        if (
+                            source_date is not None
+                            and source_date == stored_date
+                            and target_date == stored_date
+                        ):
+                            db.execute(
+                                """
+                                UPDATE messages
+                                SET source_date_verified=1, updated_at=?
+                                WHERE source_email=? AND content_hash=?
+                                """,
+                                (
+                                    now_iso(),
+                                    email,
+                                    row["content_hash"],
+                                ),
+                            )
+                            account_verified += 1
+                            totals["verified"] += 1
+                            continue
+
+                        message = fetch_source_message(
+                            source,
+                            email,
+                            folder_name,
+                            uidvalidity,
+                            uid,
+                            profiles[email],
+                        )
+                        if message.content_hash != row["content_hash"]:
+                            raise SyncError(
+                                f"Source content changed during date repair: "
+                                f"{email} {folder_name} UID {uid}"
+                            )
+                        if is_deleted_draft_message(rule, folder, message):
+                            raise SyncError(
+                                f"Tracked Outlook deleted draft encountered "
+                                f"during date repair: {email} UID {uid}"
+                            )
+                        action = sync_message(
+                            db,
+                            target,
+                            target_rule["folder"],
+                            message,
+                            rule["account_label"],
+                            source_folder_label(rule, folder),
+                            labels_by_name,
+                            run_id,
+                            force_rebuild=target_date != message.internal_date,
+                        )
+                        if action == "date_rebuilt":
+                            account_rebuilt += 1
+                            totals["date_rebuilt"] += 1
+                        else:
+                            account_verified += 1
+                            totals["verified"] += 1
+                        if (account_rebuilt + account_verified) % 100 == 0:
+                            print(
+                                json.dumps(
+                                    {
+                                        "event": "date_repair_progress",
+                                        "source": email,
+                                        "verified": account_verified,
+                                        "date_rebuilt": account_rebuilt,
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                                flush=True,
+                            )
+                    db.commit()
+                unresolved_deleted = db.execute(
+                    """
+                    SELECT COUNT(*) FROM messages
+                    WHERE source_email=? AND source_date_verified=0
+                      AND source_folder='__deleted__'
+                    """,
+                    (email,),
+                ).fetchone()[0]
+                totals["unresolved"] += int(unresolved_deleted)
+                print(
+                    json.dumps(
+                        {
+                            "event": "date_repair_source_completed",
+                            "source": email,
+                            "verified": account_verified,
+                            "date_rebuilt": account_rebuilt,
+                            "unresolved_deleted": int(unresolved_deleted),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
+            finally:
+                safe_logout(source)
+        remaining = db.execute(
+            "SELECT COUNT(*) FROM messages WHERE source_date_verified=0"
+        ).fetchone()[0]
+        print(
+            json.dumps(
+                {
+                    "event": "date_repair_completed",
+                    **totals,
+                    "remaining_unverified": int(remaining),
+                    "state_db": str(state_path),
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+        return 0 if remaining == 0 else 1
+    finally:
+        try:
+            safe_logout(target)
+        finally:
+            db.close()
 
 
 def command_watch(
@@ -2501,6 +2887,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Process higher source UIDs first",
     )
+    repair_dates_parser = subparsers.add_parser(
+        "repair-dates",
+        help="Verify source INTERNALDATE values and rebuild target mismatches",
+    )
+    repair_dates_parser.add_argument(
+        "--source",
+        help="Only this source email",
+    )
     watch_parser = subparsers.add_parser(
         "watch",
         help="Run synchronization continuously at a fixed interval",
@@ -2571,6 +2965,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 args.folder,
                 args.limit,
                 args.newest_first,
+            )
+    if args.command == "repair-dates":
+        with process_lock(state_path):
+            return command_repair_dates(
+                config,
+                profiles,
+                labels_by_name,
+                state_path,
+                args.source,
             )
     if args.command == "watch":
         if args.interval < 1:

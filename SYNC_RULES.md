@@ -46,6 +46,15 @@ python3 mail_sync.py sync
 python3 mail_sync.py sync --source 790209876@qq.com
 ```
 
+升级日期解析逻辑或迁移旧状态库后，执行源、状态库和目标日期校验：
+
+```bash
+python3 mail_sync.py repair-dates
+```
+
+该命令使用轻量元数据扫描识别日期差异，仅重建日期不一致的目标副本；
+中断后可重复运行，已验证记录不会再次处理。
+
 ## Outlook OAuth 配置
 
 Outlook.com 和 Microsoft 365 来源邮箱支持 OAuth2/XOAUTH2，不需要在配置中保存邮箱密码。
@@ -107,6 +116,9 @@ docker compose run --rm mail-sync \
 `authorize-outlook` 即可覆盖旧令牌。共享邮箱也可使用 OAuth：令牌由有权访问
 共享邮箱的用户授权，但来源配置中的 `email` 应填写共享邮箱地址。
 
+Outlook 配置中的 `"skip_deleted_drafts": true` 会忽略从草稿箱删除后进入
+Deleted 文件夹的未发送邮件；正常收到或发出后再删除的邮件仍会同步。
+
 每 60 秒自动执行一次完整增量扫描：
 
 ```bash
@@ -144,6 +156,8 @@ Linux 服务器首次部署前需要创建目录并授予容器用户写权限�
 ```bash
 mkdir -p data
 sudo chown -R 10001:10001 data
+sudo chown 10001:10001 config.json
+sudo chmod 600 config.json data/outlook-*.json
 ```
 
 如需接续已有同步进度，应先停止本地同步程序，再使用 SQLite 的 `.backup` 命令生成一致的数据库副本，并将其放到服务器项目的 `data/mail_sync_state.sqlite3`。
@@ -151,5 +165,9 @@ sudo chown -R 10001:10001 data
 ## 配置和状态
 
 - `config.json`：唯一配置文件，包含邮箱凭据、同步规则和 MailPlus 标签映射。
+  该文件不得提交到 Git，生产环境权限应为 `0600`。
 - `config.example.json`：不含密码的配置模板；首次部署先复制为 `config.json` 并填写密码。
 - `data/mail_sync_state.sqlite3`：Docker 部署使用的增量同步状态，不应删除或多实例并发写入。
+
+目标邮箱的已读、星标等系统标志仅在创建或重建副本时从来源复制；之后允许
+用户在目标邮箱独立操作，不会周期性覆盖。
