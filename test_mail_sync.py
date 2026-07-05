@@ -48,6 +48,28 @@ class MessageDateTests(unittest.TestCase):
                 db.close()
 
         self.assertIn("source_date_verified", columns)
+        self.assertIn("target_date_header_verified", columns)
+        self.assertIn("target_normalized_hash", columns)
+
+    def test_date_header_presence_is_batched_and_parsed(self):
+        client = mock.Mock()
+        client.uid.return_value = (
+            "OK",
+            [
+                (
+                    b"1 (UID 9 BODY[HEADER.FIELDS (DATE)] {39}",
+                    b"Date: Tue, 10 Nov 2020 15:44:03 +0800\r\n\r\n",
+                ),
+                (
+                    b"2 (UID 10 BODY[HEADER.FIELDS (DATE)] {2}",
+                    b"\r\n",
+                ),
+            ],
+        )
+
+        result = mail_sync.fetch_date_header_presence(client, [9, 10])
+
+        self.assertEqual(result, {9: True, 10: False})
 
     def test_split_fetch_response_preserves_trailing_internal_date_and_flags(self):
         rows = [
@@ -113,6 +135,61 @@ class MessageDateTests(unittest.TestCase):
         self.assertEqual(
             result,
             datetime.fromisoformat("2023-05-08T15:05:39+08:00"),
+        )
+
+
+class QQDateCompatibilityTests(unittest.TestCase):
+    def message(self, raw, source_email="790209876@qq.com"):
+        return mail_sync.SourceMessage(
+            source_email=source_email,
+            folder="INBOX",
+            uidvalidity=1,
+            uid=2,
+            raw=raw,
+            content_hash=mail_sync.hashlib.sha256(raw).hexdigest(),
+            message_id=None,
+            internal_date=datetime.fromisoformat(
+                "2020-11-10T15:44:03+08:00"
+            ),
+            system_flags=(),
+        )
+
+    def test_missing_date_on_qq_system_message_is_synthesized(self):
+        raw = (
+            b"X-QQ-mid: newapiserver8t1604994243t17624\r\n"
+            b"Subject: test\r\n\r\nbody\r\n"
+        )
+
+        message = self.message(raw)
+        self.assertTrue(mail_sync.needs_qq_date_header(message))
+        target_raw = mail_sync.target_message_raw(message)
+
+        self.assertTrue(
+            target_raw.startswith(
+                b"Date: Tue, 10 Nov 2020 15:44:03 +0800\r\n"
+            )
+        )
+        self.assertEqual(target_raw.split(b"\r\n", 1)[1], raw)
+
+    def test_existing_date_is_preserved_byte_for_byte(self):
+        raw = (
+            b"X-QQ-mid: value\r\n"
+            b"Date: Tue, 10 Nov 2020 15:44:03 +0800\r\n"
+            b"Subject: test\r\n\r\nbody\r\n"
+        )
+
+        message = self.message(raw)
+        self.assertFalse(mail_sync.needs_qq_date_header(message))
+        self.assertEqual(mail_sync.target_message_raw(message), raw)
+
+    def test_non_qq_headerless_message_is_not_modified(self):
+        raw = b"Subject: test\r\n\r\nbody\r\n"
+
+        self.assertEqual(
+            mail_sync.target_message_raw(
+                self.message(raw, "source@example.com")
+            ),
+            raw,
         )
 
 

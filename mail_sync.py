@@ -30,7 +30,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email import message_from_bytes
-from email.utils import parsedate_to_datetime
+from email.utils import format_datetime, parsedate_to_datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -536,6 +536,37 @@ def fetch_message_metadata(
     return results
 
 
+def fetch_date_header_presence(
+    client: imaplib.IMAP4,
+    uids: Sequence[int],
+) -> Dict[int, bool]:
+    """Check Date header presence without downloading complete messages."""
+    results: Dict[int, bool] = {}
+    for offset in range(0, len(uids), 200):
+        batch = uids[offset : offset + 200]
+        if not batch:
+            continue
+        typ, rows = client.uid(
+            "fetch",
+            ",".join(str(uid) for uid in batch),
+            "(UID BODY.PEEK[HEADER.FIELDS (DATE)])",
+        )
+        if typ != "OK":
+            raise SyncError("IMAP Date header FETCH failed")
+        for row in rows or []:
+            if not isinstance(row, tuple) or len(row) != 2:
+                continue
+            metadata, header = row
+            if not isinstance(metadata, bytes) or not isinstance(header, bytes):
+                continue
+            uid_match = UID_RE.search(metadata)
+            if uid_match:
+                results[int(uid_match.group(1))] = (
+                    message_from_bytes(header).get("Date") is not None
+                )
+    return results
+
+
 def parse_internal_date(metadata: bytes) -> Optional[datetime]:
     match = INTERNALDATE_RE.search(metadata)
     if not match:
@@ -566,6 +597,30 @@ def parse_message_date(raw: bytes) -> Optional[datetime]:
 
 def source_message_date(metadata: bytes, raw: bytes) -> Optional[datetime]:
     return parse_internal_date(metadata) or parse_message_date(raw)
+
+
+def is_qq_source(email: str) -> bool:
+    domain = email.rsplit("@", 1)[-1].casefold()
+    return domain in {"qq.com", "foxmail.com"}
+
+
+def needs_qq_date_header(message: SourceMessage) -> bool:
+    """Identify QQ system messages whose missing Date confuses MailPlus."""
+    parsed = message_from_bytes(message.raw)
+    return parsed.get("Date") is None and (
+        is_qq_source(message.source_email)
+        or parsed.get("X-QQ-mid") is not None
+    )
+
+
+def target_message_raw(message: SourceMessage) -> bytes:
+    """Return the deterministic representation written to the target mailbox."""
+    if message.internal_date is None or not needs_qq_date_header(message):
+        return message.raw
+    date_header = f"Date: {format_datetime(message.internal_date)}\r\n".encode(
+        "ascii"
+    )
+    return date_header + message.raw
 
 
 def parse_flags(metadata: bytes) -> Tuple[str, ...]:
@@ -787,6 +842,7 @@ def init_db(path: Path) -> sqlite3.Connection:
             source_email TEXT NOT NULL,
             content_hash TEXT NOT NULL,
             normalized_hash TEXT,
+            target_normalized_hash TEXT,
             message_id TEXT,
             source_folder TEXT NOT NULL,
             source_uidvalidity INTEGER NOT NULL,
@@ -794,6 +850,7 @@ def init_db(path: Path) -> sqlite3.Connection:
             source_flags TEXT NOT NULL,
             internal_date TEXT,
             source_date_verified INTEGER NOT NULL DEFAULT 0,
+            target_date_header_verified INTEGER NOT NULL DEFAULT 0,
             target_uidvalidity INTEGER NOT NULL,
             target_uid INTEGER NOT NULL,
             account_label TEXT NOT NULL,
@@ -858,6 +915,10 @@ def init_db(path: Path) -> sqlite3.Connection:
         connection.commit()
     if "normalized_hash" not in columns:
         connection.execute("ALTER TABLE messages ADD COLUMN normalized_hash TEXT")
+    if "target_normalized_hash" not in columns:
+        connection.execute(
+            "ALTER TABLE messages ADD COLUMN target_normalized_hash TEXT"
+        )
     if "folder_labels_json" not in columns:
         connection.execute(
             "ALTER TABLE messages ADD COLUMN folder_labels_json TEXT"
@@ -866,6 +927,20 @@ def init_db(path: Path) -> sqlite3.Connection:
         connection.execute(
             "ALTER TABLE messages ADD COLUMN "
             "source_date_verified INTEGER NOT NULL DEFAULT 0"
+        )
+    if "target_date_header_verified" not in columns:
+        # Existing non-QQ copies need no header migration. Existing QQ and
+        # Foxmail copies are audited once by repair-dates.
+        connection.execute(
+            "ALTER TABLE messages ADD COLUMN "
+            "target_date_header_verified INTEGER NOT NULL DEFAULT 1"
+        )
+        connection.execute(
+            """
+            UPDATE messages SET target_date_header_verified=0
+            WHERE lower(source_email) LIKE '%@qq.com'
+               OR lower(source_email) LIKE '%@foxmail.com'
+            """
         )
     pending_columns = {
         row[1]
@@ -1108,11 +1183,12 @@ def append_target_copy(
     _, uidvalidity = select_mailbox(client, target_folder, readonly=False)
     first_possible_uid = response_int(client, "UIDNEXT")
     system_flags = format_flag_list(message.system_flags)
+    target_raw = target_message_raw(message)
     typ, response = client.append(
         quote_mailbox(target_folder),
         system_flags,
         message.internal_date,
-        message.raw,
+        target_raw,
     )
     if typ != "OK":
         raise SyncError(f"APPEND failed: {response!r}")
@@ -1145,8 +1221,8 @@ def append_target_copy(
     metadata, raw = target_fetch(client, uid, include_body=True)
     if raw is None or not content_hash_matches(
         raw,
-        message.content_hash,
-        message.raw,
+        hashlib.sha256(target_raw).hexdigest(),
+        target_raw,
     ):
         raise TargetContentVerificationError(uid)
     current_flags = set(
@@ -1367,17 +1443,21 @@ def metadata_flags(metadata: bytes) -> Set[str]:
 def target_copy_matches(
     client: imaplib.IMAP4,
     uid: int,
-    content_hash: str,
+    message: SourceMessage,
     label_ids: Sequence[str],
-    expected_raw: Optional[bytes] = None,
 ) -> bool:
     try:
         metadata, raw = target_fetch(client, uid, include_body=True)
     except SyncError:
         return False
+    expected_raw = target_message_raw(message)
     return (
         raw is not None
-        and content_hash_matches(raw, content_hash, expected_raw)
+        and content_hash_matches(
+            raw,
+            hashlib.sha256(expected_raw).hexdigest(),
+            expected_raw,
+        )
         and set(label_ids).issubset(metadata_flags(metadata))
     )
 
@@ -1385,15 +1465,19 @@ def target_copy_matches(
 def repair_target_copy(
     client: imaplib.IMAP4,
     uid: int,
-    content_hash: str,
+    message: SourceMessage,
     label_ids: Sequence[str],
-    expected_raw: Optional[bytes] = None,
 ) -> bool:
     try:
         metadata, raw = target_fetch(client, uid, include_body=True)
     except SyncError:
         return False
-    if raw is None or not content_hash_matches(raw, content_hash, expected_raw):
+    expected_raw = target_message_raw(message)
+    if raw is None or not content_hash_matches(
+        raw,
+        hashlib.sha256(expected_raw).hexdigest(),
+        expected_raw,
+    ):
         return False
     missing = set(label_ids) - metadata_flags(metadata)
     for label_id in sorted(missing):
@@ -1410,9 +1494,8 @@ def repair_target_copy(
     return target_copy_matches(
         client,
         uid,
-        content_hash,
+        message,
         label_ids,
-        expected_raw,
     )
 
 
@@ -1477,9 +1560,8 @@ def recover_pending_operations(
         if new_uid is not None and not repair_target_copy(
             target,
             new_uid,
-            message.content_hash,
+            message,
             label_ids,
-            message.raw,
         ):
             error = f"Target UID {new_uid} failed pending recovery verification"
             quarantine_pending_operation(db, message, new_uid, error)
@@ -1507,9 +1589,8 @@ def recover_pending_operations(
                 if repair_target_copy(
                     target,
                     candidate,
-                    message.content_hash,
+                    message,
                     label_ids,
-                    message.raw,
                 ):
                     new_uid = candidate
                     update_pending_target_uid(db, message, candidate)
@@ -1650,17 +1731,35 @@ def upsert_state(
     if not normalized_labels:
         raise SyncError("At least one folder label is required")
     primary_folder_label = normalized_labels[0]
+    target_raw = target_message_raw(message)
+    existing = db.execute(
+        """
+        SELECT normalized_hash FROM messages
+        WHERE source_email=? AND content_hash=?
+        """,
+        (message.source_email, message.content_hash),
+    ).fetchone()
+    if content_hash_matches(message.raw, message.content_hash):
+        source_normalized_hash = normalized_content_hash(message.raw)
+    elif existing is not None and existing["normalized_hash"]:
+        # Reconciliation may reconstruct SourceMessage from an already
+        # normalized target copy rather than the original source bytes.
+        source_normalized_hash = existing["normalized_hash"]
+    else:
+        source_normalized_hash = None
     db.execute(
         """
         INSERT INTO messages (
-            source_email, content_hash, normalized_hash, message_id, source_folder,
+            source_email, content_hash, normalized_hash, target_normalized_hash,
+            message_id, source_folder,
             source_uidvalidity, source_uid, source_flags, internal_date,
-            source_date_verified,
+            source_date_verified, target_date_header_verified,
             target_uidvalidity, target_uid, account_label, folder_label,
             folder_labels_json, last_seen_run, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(source_email, content_hash) DO UPDATE SET
             normalized_hash=excluded.normalized_hash,
+            target_normalized_hash=excluded.target_normalized_hash,
             message_id=excluded.message_id,
             source_folder=excluded.source_folder,
             source_uidvalidity=excluded.source_uidvalidity,
@@ -1668,6 +1767,7 @@ def upsert_state(
             source_flags=excluded.source_flags,
             internal_date=excluded.internal_date,
             source_date_verified=1,
+            target_date_header_verified=1,
             target_uidvalidity=excluded.target_uidvalidity,
             target_uid=excluded.target_uid,
             account_label=excluded.account_label,
@@ -1679,7 +1779,8 @@ def upsert_state(
         (
             message.source_email,
             message.content_hash,
-            normalized_content_hash(message.raw),
+            source_normalized_hash,
+            normalized_content_hash(target_raw),
             message.message_id,
             message.folder,
             message.uidvalidity,
@@ -2024,9 +2125,13 @@ def reconcile_deleted_messages(
                 f"Cannot rebuild source message {row['content_hash']}: "
                 "target body is missing"
             )
-        normalized_hash = row["normalized_hash"]
-        if normalized_hash:
-            content_matches = normalized_content_hash(raw) == normalized_hash
+        expected_target_hash = (
+            row["target_normalized_hash"] or row["normalized_hash"]
+        )
+        if expected_target_hash:
+            content_matches = (
+                normalized_content_hash(raw) == expected_target_hash
+            )
         else:
             content_matches = content_hash_matches(raw, row["content_hash"])
         if not content_matches:
@@ -2536,6 +2641,7 @@ def command_repair_dates(
     totals = {
         "verified": 0,
         "date_rebuilt": 0,
+        "qq_header_rebuilt": 0,
         "unresolved": 0,
     }
     try:
@@ -2561,7 +2667,11 @@ def command_repair_dates(
                 rows = db.execute(
                     """
                     SELECT * FROM messages
-                    WHERE source_email=? AND source_date_verified=0
+                    WHERE source_email=?
+                      AND (
+                          source_date_verified=0
+                          OR target_date_header_verified=0
+                      )
                       AND source_folder<>'__deleted__'
                     ORDER BY source_folder, source_uidvalidity, source_uid
                     """,
@@ -2573,6 +2683,10 @@ def command_repair_dates(
                     readonly=True,
                 )
                 target_metadata = fetch_message_metadata(
+                    target,
+                    [int(row["target_uid"]) for row in rows],
+                )
+                target_date_headers = fetch_date_header_presence(
                     target,
                     [int(row["target_uid"]) for row in rows],
                 )
@@ -2621,15 +2735,29 @@ def command_repair_dates(
                             if row["internal_date"]
                             else None
                         )
+                        target_header_audit_required = (
+                            not row["target_date_header_verified"]
+                            and is_qq_source(email)
+                        )
+                        target_has_date_header = target_date_headers.get(
+                            int(row["target_uid"]),
+                            False,
+                        )
                         if (
                             source_date is not None
                             and source_date == stored_date
                             and target_date == stored_date
+                            and (
+                                not target_header_audit_required
+                                or target_has_date_header
+                            )
                         ):
                             db.execute(
                                 """
                                 UPDATE messages
-                                SET source_date_verified=1, updated_at=?
+                                SET source_date_verified=1,
+                                    target_date_header_verified=1,
+                                    updated_at=?
                                 WHERE source_email=? AND content_hash=?
                                 """,
                                 (
@@ -2660,6 +2788,11 @@ def command_repair_dates(
                                 f"Tracked Outlook deleted draft encountered "
                                 f"during date repair: {email} UID {uid}"
                             )
+                        qq_header_rebuild = (
+                            is_qq_source(email)
+                            and needs_qq_date_header(message)
+                            and message.internal_date is not None
+                        )
                         action = sync_message(
                             db,
                             target,
@@ -2669,11 +2802,16 @@ def command_repair_dates(
                             source_folder_label(rule, folder),
                             labels_by_name,
                             run_id,
-                            force_rebuild=target_date != message.internal_date,
+                            force_rebuild=(
+                                target_date != message.internal_date
+                                or qq_header_rebuild
+                            ),
                         )
                         if action == "date_rebuilt":
                             account_rebuilt += 1
                             totals["date_rebuilt"] += 1
+                            if qq_header_rebuild:
+                                totals["qq_header_rebuilt"] += 1
                         else:
                             account_verified += 1
                             totals["verified"] += 1
@@ -2685,6 +2823,9 @@ def command_repair_dates(
                                         "source": email,
                                         "verified": account_verified,
                                         "date_rebuilt": account_rebuilt,
+                                        "qq_header_rebuilt": totals[
+                                            "qq_header_rebuilt"
+                                        ],
                                     },
                                     ensure_ascii=False,
                                 ),
@@ -2694,7 +2835,11 @@ def command_repair_dates(
                 unresolved_deleted = db.execute(
                     """
                     SELECT COUNT(*) FROM messages
-                    WHERE source_email=? AND source_date_verified=0
+                    WHERE source_email=?
+                      AND (
+                          source_date_verified=0
+                          OR target_date_header_verified=0
+                      )
                       AND source_folder='__deleted__'
                     """,
                     (email,),
@@ -2716,7 +2861,11 @@ def command_repair_dates(
             finally:
                 safe_logout(source)
         remaining = db.execute(
-            "SELECT COUNT(*) FROM messages WHERE source_date_verified=0"
+            """
+            SELECT COUNT(*) FROM messages
+            WHERE source_date_verified=0
+               OR target_date_header_verified=0
+            """
         ).fetchone()[0]
         print(
             json.dumps(

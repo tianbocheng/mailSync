@@ -55,6 +55,12 @@ python3 mail_sync.py repair-dates
 该命令使用轻量元数据扫描识别日期差异，仅重建日期不一致的目标副本；
 中断后可重复运行，已验证记录不会再次处理。
 
+部分 QQ 系统邮件没有标准 `Date` 头，MailPlus 网页端会将其显示为导入时间。
+同步器会在写入目标副本时使用来源 `INTERNALDATE` 补充标准 `Date` 头，同时保留
+来源原始内容哈希用于去重。升级后执行一次 `repair-dates`，命令会审计已有 QQ
+和 Foxmail 记录，只重建缺少 `Date` 头的目标副本。运行历史修复前应停止常驻
+同步进程并备份 `data/mail_sync_state.sqlite3`。
+
 ## Outlook OAuth 配置
 
 Outlook.com 和 Microsoft 365 来源邮箱支持 OAuth2/XOAUTH2，不需要在配置中保存邮箱密码。
