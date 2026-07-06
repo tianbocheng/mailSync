@@ -4,6 +4,7 @@ __pycache__/
 *.pyc
 *outlook*token*.json
 config.json
+config/config.json
 mail_sync_state.sqlite3
 data/mail_sync_state.sqlite3
 *.log

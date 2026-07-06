@@ -7,14 +7,20 @@ WORKDIR /app
 
 RUN groupadd --gid 10001 mailsync \
     && useradd --uid 10001 --gid mailsync --create-home mailsync \
-    && mkdir -p /data \
+    && mkdir -p /app/config /app/data /data \
     && chown -R mailsync:mailsync /app /data
 
 COPY --chown=mailsync:mailsync \
     mail_sync.py \
     /app/
 
+COPY --chown=mailsync:mailsync \
+    src \
+    /app/src
+
+ENV PYTHONPATH=/app/src
+
 USER mailsync
 
-ENTRYPOINT ["python3", "-u", "/app/mail_sync.py", "--config", "/app/config.json"]
+ENTRYPOINT ["python3", "-u", "/app/mail_sync.py", "--config", "/app/config/config.json"]
 CMD ["watch"]

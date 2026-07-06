@@ -16,7 +16,8 @@ services:
       SYNC_POLL_INTERVAL: ${SYNC_POLL_INTERVAL:-3}
       SYNC_BATCH_SIZE: ${SYNC_BATCH_SIZE:-5}
     volumes:
-      - ./config.json:/app/config.json:ro
+      - ./config/config.json:/app/config/config.json:ro
+      - ./data:/app/config/data
       - ./data:/app/data
     tmpfs:
       - /tmp
