@@ -148,6 +148,32 @@ SYNC_INTERVAL=900 python3 mail_sync.py watch
 命令行参数 `--interval` 可以覆盖。多个完整扫描会均匀错峰。某个来源需要
 单独完整扫描周期时，可在该来源配置中设置 `"sync_interval": 120`。
 
+如果某个来源邮箱的 IMAP 网络需要代理，可只在该来源配置中增加
+`imap_proxy`。同步器会通过 HTTP CONNECT 代理建立到 IMAP 服务器的 TCP
+隧道，再在隧道内正常进行 TLS 和 IMAP 登录；未配置的邮箱仍然直连：
+
+```json
+{
+  "email": "tianbocheng11@gmail.com",
+  "imap_server": "imap.gmail.com",
+  "imap_port": 993,
+  "imap_proxy": "http://192.168.1.178:6152",
+  "use_ssl": true
+}
+```
+
+等价对象写法：
+
+```json
+{
+  "imap_proxy": {
+    "type": "http_connect",
+    "host": "192.168.1.178",
+    "port": 6152
+  }
+}
+```
+
 常驻模式默认每个来源每轮处理最多 5 封变化邮件，并优先处理最新邮件，避免首次全量补齐时某个大邮箱长期独占调度器。可通过 `SYNC_BATCH_SIZE` 或来源配置中的 `"batch_size"` 调整。积压处理完成后，脚本会自动执行完整扫描和删除对账。单轮失败会记录错误并继续后续调度；进程重启时会先恢复 SQLite 中尚未完成的远程写入操作。
 
 ## Docker Compose

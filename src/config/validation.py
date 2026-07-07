@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Dict, Optional, Set
 
 from common.errors import SyncError
+from config.proxy import parse_imap_proxy
 
 
 MICROSOFT_IMAP_SCOPE = "https://outlook.office.com/IMAP.AccessAsUser.All"
@@ -79,6 +80,7 @@ def validate_config(config: dict, labels_by_name: Dict[str, str]) -> None:
             raise SyncError(f"Missing target.{field} in configuration")
     if oauth_settings(target) is None and not target.get("password"):
         raise SyncError(f"Missing password for target mailbox {target['email']}")
+    parse_imap_proxy(target.get("imap_proxy"), f"target {target['email']}")
 
     sources = config.get("sources")
     if not isinstance(sources, list) or not sources:
@@ -99,6 +101,7 @@ def validate_config(config: dict, labels_by_name: Dict[str, str]) -> None:
             raise SyncError(f"Missing imap_server for source {email}")
         if oauth_settings(rule) is None and not rule.get("password"):
             raise SyncError(f"Missing password for source mailbox {email}")
+        parse_imap_proxy(rule.get("imap_proxy"), email)
 
         require_label(
             labels_by_name,

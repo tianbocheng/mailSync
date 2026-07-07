@@ -4,17 +4,79 @@ import imaplib
 
 from auth.oauth import authenticate_oauth
 from common.errors import SyncError
+from config.proxy import ImapProxySettings, profile_imap_proxy
 from config.validation import oauth_settings
+from connection.proxy import http_connect_socket
 from imap.protocol import select_mailbox
+
+
+class ProxiedIMAP4(imaplib.IMAP4):
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        proxy: ImapProxySettings,
+        timeout: float | None = None,
+    ):
+        self._mail_sync_proxy = proxy
+        super().__init__(host, port, timeout=timeout)
+
+    def _create_socket(self, timeout):
+        return http_connect_socket(
+            self.host,
+            self.port,
+            self._mail_sync_proxy,
+            timeout,
+        )
+
+
+class ProxiedIMAP4_SSL(imaplib.IMAP4_SSL):
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        proxy: ImapProxySettings,
+        timeout: float | None = None,
+    ):
+        self._mail_sync_proxy = proxy
+        super().__init__(host, port, timeout=timeout)
+
+    def _create_socket(self, timeout):
+        sock = http_connect_socket(
+            self.host,
+            self.port,
+            self._mail_sync_proxy,
+            timeout,
+        )
+        try:
+            return self.ssl_context.wrap_socket(sock, server_hostname=self.host)
+        except Exception:
+            sock.close()
+            raise
 
 
 def connect(profile: dict) -> imaplib.IMAP4:
     host = profile["imap_server"]
     port = int(profile.get("imap_port", 993 if profile.get("use_ssl", True) else 143))
+    proxy = profile_imap_proxy(profile)
+    timeout = profile.get("imap_timeout")
+    if timeout is not None:
+        timeout = float(timeout)
     if profile.get("use_ssl", True):
-        client: imaplib.IMAP4 = imaplib.IMAP4_SSL(host, port)
+        if proxy is not None:
+            client: imaplib.IMAP4 = ProxiedIMAP4_SSL(
+                host,
+                port,
+                proxy,
+                timeout=timeout,
+            )
+        else:
+            client = imaplib.IMAP4_SSL(host, port, timeout=timeout)
     else:
-        client = imaplib.IMAP4(host, port)
+        if proxy is not None:
+            client = ProxiedIMAP4(host, port, proxy, timeout=timeout)
+        else:
+            client = imaplib.IMAP4(host, port, timeout=timeout)
     if oauth_settings(profile) is not None:
         authenticate_oauth(client, profile)
     else:

@@ -77,6 +77,33 @@ class OAuthTests(unittest.TestCase):
             ],
         )
 
+    def test_imap_proxy_uses_proxied_ssl_client(self):
+        client = FakeImap()
+        profile = {
+            "email": "user@gmail.com",
+            "password": "secret",
+            "imap_server": "imap.gmail.com",
+            "imap_port": 993,
+            "imap_proxy": "http://192.168.1.178:6152",
+        }
+        with (
+            mock.patch.object(
+                connection_module,
+                "ProxiedIMAP4_SSL",
+                return_value=client,
+            ) as proxied,
+            mock.patch.object(connection_module.imaplib, "IMAP4_SSL") as direct,
+        ):
+            result = mail_sync.connect(profile)
+        self.assertIs(result, client)
+        direct.assert_not_called()
+        host, port, proxy = proxied.call_args.args
+        self.assertEqual(host, "imap.gmail.com")
+        self.assertEqual(port, 993)
+        self.assertEqual(proxy.host, "192.168.1.178")
+        self.assertEqual(proxy.port, 6152)
+        self.assertEqual(client.login_calls, [("user@gmail.com", "secret")])
+
     def test_expired_token_is_refreshed_and_rotated_atomically(self):
         with tempfile.TemporaryDirectory() as directory:
             token_file = Path(directory) / "outlook-token.json"
@@ -257,6 +284,25 @@ class ConfigValidationTests(unittest.TestCase):
         labels = mail_sync.label_id_map(config["synology_labels"])
 
         mail_sync.validate_config(config, labels)
+
+    def test_imap_proxy_config_passes_preflight(self):
+        config = self.valid_config()
+        config["sources"][0]["imap_proxy"] = {
+            "type": "http_connect",
+            "host": "192.168.1.178",
+            "port": 6152,
+        }
+        labels = mail_sync.label_id_map(config["synology_labels"])
+
+        mail_sync.validate_config(config, labels)
+
+    def test_invalid_imap_proxy_fails_preflight(self):
+        config = self.valid_config()
+        config["sources"][0]["imap_proxy"] = "socks5://127.0.0.1:1080"
+        labels = mail_sync.label_id_map(config["synology_labels"])
+
+        with self.assertRaisesRegex(mail_sync.SyncError, "IMAP proxy URL"):
+            mail_sync.validate_config(config, labels)
 
     def test_missing_label_fails_before_syncing(self):
         config = self.valid_config()
