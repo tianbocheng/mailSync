@@ -19,6 +19,8 @@ services:
       SYNC_INTERVAL: ${SYNC_INTERVAL:-900}
       SYNC_POLL_INTERVAL: ${SYNC_POLL_INTERVAL:-3}
       SYNC_BATCH_SIZE: ${SYNC_BATCH_SIZE:-5}
+    extra_hosts:
+      - "imap.lantian2019.cn:192.168.1.17"
     command: ["run", "--host", "0.0.0.0"]
     volumes:
       - ../data:/app/data

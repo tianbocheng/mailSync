@@ -57,6 +57,7 @@ def reconcile_deleted_messages(
     run_id: str,
     target_email: str = "",
     target_service_address: str = "",
+    rebuild_limit: int | None = None,
 ) -> int:
     """Reconcile the exact target label set from all current source locations."""
     source_email = source_rule["email"]
@@ -140,6 +141,12 @@ def reconcile_deleted_messages(
                 if _target_copy_already_deleted(row):
                     _mark_out_of_scope_deleted(db, row, run_id)
                     continue
+                if _rebuild_limit_reached(
+                    source_email,
+                    rebuilt,
+                    rebuild_limit,
+                ):
+                    break
                 delete_target_copy(
                     target,
                     row_target_folder,
@@ -194,6 +201,9 @@ def reconcile_deleted_messages(
                     ),
                 )
             continue
+
+        if _rebuild_limit_reached(source_email, rebuilt, rebuild_limit):
+            break
 
         select_mailbox(target, row_target_folder, readonly=False)
         metadata, raw = target_fetch(
@@ -334,6 +344,27 @@ def reconcile_deleted_messages(
 
     db.commit()
     return rebuilt
+
+
+def _rebuild_limit_reached(
+    source_email: str,
+    rebuilt: int,
+    rebuild_limit: int | None,
+) -> bool:
+    if rebuild_limit is None or rebuild_limit < 1 or rebuilt < rebuild_limit:
+        return False
+    print(
+        json.dumps(
+            {
+                "event": "source_reconciliation_deferred",
+                "source": source_email,
+                "rebuilt": rebuilt,
+                "limit": rebuild_limit,
+            },
+            ensure_ascii=False,
+        )
+    )
+    return True
 
 
 def _out_of_scope_policy(source_rule: dict) -> str:

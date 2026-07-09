@@ -438,6 +438,7 @@ def command_sync(
                         run_id,
                         target_email,
                         target_service_address,
+                        rebuild_limit=limit,
                     )
                     if rebuilt_deleted:
                         summary["source_deleted_rebuilt"] = (

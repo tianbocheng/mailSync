@@ -56,6 +56,52 @@ class LoginUserSchemaTests(unittest.TestCase):
 
 
 class QuarantineTests(unittest.TestCase):
+    def _insert_pending_operation(
+        self,
+        db,
+        raw: bytes,
+        *,
+        source_uid: int = 2,
+        old_target_uid=None,
+        target_uid_before: int = 4,
+        new_target_uid=None,
+        status: str = "pending",
+    ) -> str:
+        content_hash = mail_sync.hashlib.sha256(raw).hexdigest()
+        db.execute(
+            """
+            INSERT INTO pending_operations (
+                source_email, content_hash, message_id, source_folder,
+                source_uidvalidity, source_uid, source_flags, internal_date,
+                raw_message, account_label, folder_label, old_target_uid,
+                target_uidvalidity, target_uid_before, new_target_uid,
+                status, last_error, created_at, updated_at, target_folder
+            ) VALUES (?, ?, NULL, ?, ?, ?, '[]', NULL, ?, ?, ?,
+                      ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "source@example.com",
+                content_hash,
+                "INBOX",
+                1,
+                source_uid,
+                raw,
+                "SYNC:source@example.com",
+                "BOX:收件箱",
+                old_target_uid,
+                3,
+                target_uid_before,
+                new_target_uid,
+                status,
+                "verification failed" if status == "quarantined" else None,
+                mail_sync.now_iso(),
+                mail_sync.now_iso(),
+                "INBOX",
+            ),
+        )
+        db.commit()
+        return content_hash
+
     def test_quarantined_message_is_not_appended_again(self):
         with tempfile.TemporaryDirectory() as directory:
             db = mail_sync.init_db(Path(directory) / "state.sqlite3")
@@ -188,6 +234,134 @@ class QuarantineTests(unittest.TestCase):
             self.assertEqual(row["last_sync_action"], "pending_operation_recovered")
             pending = db.execute("SELECT * FROM pending_operations").fetchone()
             self.assertIsNone(pending)
+            db.close()
+
+    def test_pending_recovery_tries_old_target_uid_before_candidate_scan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = mail_sync.init_db(Path(directory) / "state.sqlite3")
+            raw = b"Subject: reuse old\r\n\r\nbody\r\n"
+            content_hash = self._insert_pending_operation(
+                db,
+                raw,
+                old_target_uid=9,
+                target_uid_before=100,
+            )
+            with (
+                mock.patch.object(
+                    recovery_module,
+                    "select_mailbox",
+                    return_value=(10, 3),
+                ),
+                mock.patch.object(
+                    recovery_module,
+                    "repair_target_copy",
+                    return_value=True,
+                ) as repair,
+                mock.patch.object(recovery_module, "search_uids") as search,
+            ):
+                recovered = mail_sync.recover_pending_operations(
+                    db,
+                    mock.Mock(),
+                    "INBOX",
+                    {
+                        "SYNC:source@example.com": "$account",
+                        "BOX:收件箱": "$folder",
+                    },
+                    source_emails=("source@example.com",),
+                )
+
+            self.assertEqual(recovered, 1)
+            repair.assert_called_once()
+            self.assertEqual(repair.call_args.args[2], 9)
+            search.assert_not_called()
+            row = db.execute(
+                "SELECT target_uid FROM messages WHERE content_hash=?",
+                (content_hash,),
+            ).fetchone()
+            self.assertEqual(row["target_uid"], 9)
+            self.assertIsNone(db.execute("SELECT 1 FROM pending_operations").fetchone())
+            db.close()
+
+    def test_quarantined_pending_without_new_uid_does_not_scan_candidates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = mail_sync.init_db(Path(directory) / "state.sqlite3")
+            self._insert_pending_operation(
+                db,
+                b"Subject: quarantined\r\n\r\nbody\r\n",
+                target_uid_before=100,
+                status="quarantined",
+            )
+            with (
+                mock.patch.object(
+                    recovery_module,
+                    "select_mailbox",
+                    return_value=(10, 3),
+                ),
+                mock.patch.object(recovery_module, "repair_target_copy") as repair,
+                mock.patch.object(recovery_module, "search_uids") as search,
+            ):
+                recovered = mail_sync.recover_pending_operations(
+                    db,
+                    mock.Mock(),
+                    "INBOX",
+                    {
+                        "SYNC:source@example.com": "$account",
+                        "BOX:收件箱": "$folder",
+                    },
+                    source_emails=("source@example.com",),
+                    include_quarantined=True,
+                )
+
+            self.assertEqual(recovered, 0)
+            repair.assert_not_called()
+            search.assert_not_called()
+            row = db.execute("SELECT status FROM pending_operations").fetchone()
+            self.assertEqual(row["status"], "quarantined")
+            db.close()
+
+    def test_pending_recovery_quarantines_excessive_candidate_scan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = mail_sync.init_db(Path(directory) / "state.sqlite3")
+            self._insert_pending_operation(
+                db,
+                b"Subject: many candidates\r\n\r\nbody\r\n",
+                target_uid_before=10,
+            )
+            with (
+                mock.patch.object(
+                    recovery_module,
+                    "select_mailbox",
+                    return_value=(10, 3),
+                ),
+                mock.patch.object(
+                    recovery_module,
+                    "search_uids",
+                    return_value=list(range(11, 63)),
+                ),
+                mock.patch.object(recovery_module, "repair_target_copy") as repair,
+            ):
+                recovered = mail_sync.recover_pending_operations(
+                    db,
+                    mock.Mock(),
+                    "INBOX",
+                    {
+                        "SYNC:source@example.com": "$account",
+                        "BOX:收件箱": "$folder",
+                    },
+                    source_emails=("source@example.com",),
+                )
+
+            self.assertEqual(recovered, 0)
+            repair.assert_not_called()
+            row = db.execute(
+                """
+                SELECT status, new_target_uid, last_error
+                FROM pending_operations
+                """
+            ).fetchone()
+            self.assertEqual(row["status"], "quarantined")
+            self.assertEqual(row["new_target_uid"], 62)
+            self.assertIn("52 target candidates", row["last_error"])
             db.close()
 
 class DuplicateLocationTests(unittest.TestCase):

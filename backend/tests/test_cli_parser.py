@@ -64,6 +64,24 @@ class ParserDefaultsTests(unittest.TestCase):
 
 
 class ScheduleRefreshTests(unittest.TestCase):
+    def test_build_initial_schedule_uses_source_interval_for_staggering(self):
+        rules = [
+            {"email": "a@example.com", "sync_interval": 100},
+            {"email": "b@example.com", "sync_interval": 100},
+            {"email": "c@example.com", "sync_interval": 100},
+            {"email": "d@example.com", "sync_interval": 100},
+        ]
+
+        with mock.patch.object(schedule_module.time, "monotonic", return_value=1000.0):
+            schedule = mail_sync.build_source_schedule(rules, 900)
+
+        self.assertEqual([item["email"] for item in schedule], [rule["email"] for rule in rules])
+        self.assertEqual([item["interval"] for item in schedule], [100, 100, 100, 100])
+        self.assertEqual(
+            [item["next_run"] for item in schedule],
+            [1000.0, 1025.0, 1050.0, 1075.0],
+        )
+
     def test_refresh_applies_changed_interval_and_batch_size(self):
         existing = [
             {

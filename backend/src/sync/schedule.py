@@ -12,12 +12,16 @@ def build_source_schedule(
     rules: Sequence[dict],
     interval: int,
 ) -> list[dict]:
-    slot_seconds = interval / len(rules)
     started_at = time.monotonic()
     schedule = []
     for index, rule in enumerate(rules):
         source_interval, batch_size = _source_schedule_values(rule, interval)
-        next_run = started_at + index * slot_seconds
+        next_run = started_at + _initial_source_offset(
+            index,
+            len(rules),
+            source_interval,
+            interval,
+        )
         schedule.append(
             {
                 "email": rule["email"],
@@ -41,14 +45,18 @@ def refresh_source_schedule(
         return build_source_schedule(rules, interval)
 
     existing_by_email = {str(item["email"]): item for item in schedule}
-    slot_seconds = interval / len(rules)
     now = time.monotonic()
     refreshed = []
     for index, rule in enumerate(rules):
         source_interval, batch_size = _source_schedule_values(rule, interval)
         existing = existing_by_email.get(str(rule["email"]))
         if existing is None:
-            next_run = now + index * slot_seconds
+            next_run = now + _initial_source_offset(
+                index,
+                len(rules),
+                source_interval,
+                interval,
+            )
             last_run = next_run - source_interval
         else:
             previous_interval = int(existing["interval"])
@@ -71,6 +79,16 @@ def refresh_source_schedule(
             }
         )
     return refreshed
+
+
+def _initial_source_offset(
+    index: int,
+    source_count: int,
+    source_interval: int,
+    interval: int,
+) -> float:
+    slot_window = min(float(interval), float(source_interval))
+    return index * (slot_window / source_count)
 
 
 def _source_schedule_values(rule: dict, interval: int) -> tuple[int, int]:

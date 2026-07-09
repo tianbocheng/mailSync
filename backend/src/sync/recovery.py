@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import imaplib
 import json
+import os
 import sqlite3
 import uuid
 from typing import Dict, Iterable
@@ -26,6 +27,9 @@ from sync.pending import (
 )
 from sync.records import upsert_message_location, upsert_state
 from sync.target_identity import target_identity_filter
+
+
+DEFAULT_PENDING_RECOVERY_CANDIDATE_LIMIT = 50
 
 
 def recover_pending_operations(
@@ -103,6 +107,7 @@ def recover_pending_operations(
             )
 
         new_uid = int(row["new_target_uid"]) if row["new_target_uid"] else None
+        old_uid = int(row["old_target_uid"]) if row["old_target_uid"] else None
         if new_uid is not None and not repair_target_copy(
             target,
             operation_target_folder,
@@ -129,11 +134,52 @@ def recover_pending_operations(
             continue
 
         if new_uid is None:
+            if old_uid is not None and repair_target_copy(
+                target,
+                operation_target_folder,
+                old_uid,
+                message,
+                label_ids,
+            ):
+                new_uid = old_uid
+                update_pending_target_uid(db, message, old_uid)
+
+        if new_uid is None and row["status"] == "quarantined":
+            continue
+
+        if new_uid is None:
             candidates = [
                 uid
                 for uid in search_uids(target)
                 if uid > int(row["target_uid_before"])
             ]
+            candidate_limit = _pending_recovery_candidate_limit()
+            if candidate_limit > 0 and len(candidates) > candidate_limit:
+                failed_uid = candidates[-1]
+                error = (
+                    f"Pending recovery found {len(candidates)} target "
+                    f"candidates after UID {row['target_uid_before']}; "
+                    f"limit is {candidate_limit}"
+                )
+                quarantine_pending_operation(
+                    db,
+                    message,
+                    failed_uid,
+                    error,
+                )
+                print(
+                    json.dumps(
+                        {
+                            "action": "pending_operation_quarantined",
+                            "source": message.source_email,
+                            "source_uid": message.uid,
+                            "target_uid": failed_uid,
+                            "error": error,
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+                continue
             for candidate in reversed(candidates):
                 if repair_target_copy(
                     target,
@@ -203,7 +249,6 @@ def recover_pending_operations(
                 continue
             update_pending_target_uid(db, message, new_uid)
 
-        old_uid = int(row["old_target_uid"]) if row["old_target_uid"] else None
         if old_uid is not None and old_uid != new_uid:
             delete_target_copy(target, operation_target_folder, old_uid)
 
@@ -248,3 +293,13 @@ def recover_pending_operations(
             )
         )
     return recovered
+
+
+def _pending_recovery_candidate_limit() -> int:
+    raw = os.environ.get("PENDING_RECOVERY_CANDIDATE_LIMIT", "")
+    if not raw:
+        return DEFAULT_PENDING_RECOVERY_CANDIDATE_LIMIT
+    try:
+        return int(raw)
+    except ValueError:
+        return DEFAULT_PENDING_RECOVERY_CANDIDATE_LIMIT
