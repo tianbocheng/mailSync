@@ -101,9 +101,7 @@ def ensure_config_tables(db: sqlite3.Connection) -> None:
             extra_json TEXT,
             last_sync_status TEXT NOT NULL DEFAULT 'ok',
             last_sync_error_summary TEXT,
-            last_sync_error_detail TEXT,
-            last_sync_error_at TEXT,
-            last_sync_success_at TEXT
+            last_sync_error_detail TEXT
         );
         CREATE TABLE IF NOT EXISTS folder_rules (
             source_email TEXT NOT NULL,
@@ -462,10 +460,6 @@ def _migrate_source_rule_status_columns(
         db.execute(
             "ALTER TABLE source_rules ADD COLUMN last_sync_error_detail TEXT"
         )
-    if "last_sync_error_at" not in columns:
-        db.execute("ALTER TABLE source_rules ADD COLUMN last_sync_error_at TEXT")
-    if "last_sync_success_at" not in columns:
-        db.execute("ALTER TABLE source_rules ADD COLUMN last_sync_success_at TEXT")
 
 
 def _drop_obsolete_rule_status_table(db: sqlite3.Connection) -> None:

@@ -206,16 +206,28 @@ def reconcile_deleted_messages(
             break
 
         select_mailbox(target, row_target_folder, readonly=False)
-        metadata, raw = target_fetch(
-            target,
-            int(row["target_uid"]),
-            include_body=True,
-        )
-        if raw is None:
-            raise SyncError(
-                f"Cannot rebuild source message {row['content_hash']}: "
-                "target body is missing"
+        try:
+            metadata, raw = target_fetch(
+                target,
+                int(row["target_uid"]),
+                include_body=True,
             )
+        except SyncError as exc:
+            _mark_reconciliation_skipped(
+                db,
+                row,
+                run_id,
+                f"target body unavailable: {exc}",
+            )
+            continue
+        if raw is None:
+            _mark_reconciliation_skipped(
+                db,
+                row,
+                run_id,
+                "target body is missing",
+            )
+            continue
         expected_target_hash = (
             row["target_normalized_hash"] or row["normalized_hash"]
         )
@@ -365,6 +377,40 @@ def _rebuild_limit_reached(
         )
     )
     return True
+
+
+def _mark_reconciliation_skipped(
+    db: sqlite3.Connection,
+    row: sqlite3.Row,
+    run_id: str,
+    reason: str,
+) -> None:
+    db.execute(
+        """
+        UPDATE messages SET
+            last_sync_action='source_reconciliation_skipped',
+            last_seen_run=?, updated_at=?
+        WHERE source_email=? AND content_hash=?
+        """,
+        (
+            run_id,
+            now_iso(),
+            row["source_email"],
+            row["content_hash"],
+        ),
+    )
+    print(
+        json.dumps(
+            {
+                "event": "source_reconciliation_skipped",
+                "source": row["source_email"],
+                "content_hash": row["content_hash"],
+                "target_uid": row["target_uid"],
+                "reason": reason,
+            },
+            ensure_ascii=False,
+        )
+    )
 
 
 def _out_of_scope_policy(source_rule: dict) -> str:

@@ -728,6 +728,90 @@ class DuplicateLocationTests(unittest.TestCase):
             self.assertEqual(row["target_uid"], 31)
             db.close()
 
+    def test_reconcile_skips_unreadable_target_body(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = mail_sync.init_db(Path(directory) / "state.sqlite3")
+            raw = b"Subject: relabel\r\n\r\nbody\r\n"
+            message = mail_sync.SourceMessage(
+                source_email="source@example.com",
+                folder="INBOX",
+                uidvalidity=1,
+                uid=10,
+                raw=raw,
+                content_hash=mail_sync.content_hash(raw),
+                message_id="<relabel@example.com>",
+                internal_date=datetime(2024, 1, 1, tzinfo=timezone.utc),
+                system_flags=(),
+            )
+            mail_sync.upsert_state(
+                db,
+                message,
+                2,
+                20,
+                "",
+                ("BOX:收件箱",),
+                "old-run",
+                target_folder="INBOX",
+            )
+            mail_sync.upsert_message_location(
+                db,
+                message,
+                "BOX:收件箱",
+                "current-run",
+            )
+            db.commit()
+
+            with (
+                mock.patch.object(reconcile_module, "select_mailbox"),
+                mock.patch.object(
+                    reconcile_module,
+                    "target_fetch",
+                    side_effect=mail_sync.SyncError(
+                        "IMAP FETCH did not return a message body"
+                    ),
+                ) as target_fetch,
+                mock.patch.object(
+                    reconcile_module,
+                    "append_target_copy",
+                ) as append,
+                mock.patch.object(reconcile_module, "delete_target_copy") as delete,
+            ):
+                rebuilt = mail_sync.reconcile_deleted_messages(
+                    db,
+                    mock.Mock(),
+                    "INBOX",
+                    {
+                        "email": "source@example.com",
+                        "folder_labels": {
+                            "INBOX": ["BOX:收件箱", "SYNC:source@example.com"],
+                        },
+                    },
+                    {
+                        "BOX:收件箱": "$inbox",
+                        "SYNC:source@example.com": "$account",
+                    },
+                    "current-run",
+                )
+
+            self.assertEqual(rebuilt, 0)
+            target_fetch.assert_called_once()
+            append.assert_not_called()
+            delete.assert_not_called()
+            row = db.execute(
+                """
+                SELECT * FROM messages
+                WHERE source_email=? AND content_hash=?
+                """,
+                ("source@example.com", message.content_hash),
+            ).fetchone()
+            self.assertEqual(row["last_sync_action"], "source_reconciliation_skipped")
+            self.assertEqual(row["target_uid"], 20)
+            self.assertCountEqual(
+                mail_sync.row_folder_labels(row),
+                ("BOX:收件箱",),
+            )
+            db.close()
+
     def test_unchanged_location_can_defer_commit_for_batching(self):
         with tempfile.TemporaryDirectory() as directory:
             db = mail_sync.init_db(Path(directory) / "state.sqlite3")

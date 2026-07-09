@@ -65,11 +65,6 @@
             </span>
           </template>
         </el-table-column>
-        <el-table-column prop="last_sync_at" label="时间" min-width="120">
-          <template #default="{ row }">
-            {{ row.last_sync_at || row.last_sync_time || "未同步" }}
-          </template>
-        </el-table-column>
         <el-table-column label="操作" width="190" fixed="right">
           <template #default="{ row }">
             <div class="inline-actions rule-actions">
@@ -284,10 +279,8 @@ function ruleErrorLines(row) {
   const lines = [];
   const summary = String(row.sync_error_summary || "").trim();
   const detail = String(row.sync_error_detail || "").trim();
-  const happenedAt = String(row.sync_last_error_at || "").trim();
   lines.push(summary || "规则初始化失败");
   if (detail && detail !== summary) lines.push(detail);
-  if (happenedAt) lines.push(`时间：${happenedAt}`);
   return lines;
 }
 

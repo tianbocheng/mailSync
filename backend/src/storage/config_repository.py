@@ -205,8 +205,7 @@ def list_source_rules(db: sqlite3.Connection) -> List[sqlite3.Row]:
                s.skip_deleted_drafts, s.extra_json, s.enabled,
                a.imap_server,
                s.last_sync_status, s.last_sync_error_summary,
-               s.last_sync_error_detail, s.last_sync_error_at,
-               s.last_sync_success_at,
+               s.last_sync_error_detail,
                COUNT(f.folder_name) AS folder_rule_count
         FROM source_rules s
         LEFT JOIN mail_accounts a
@@ -2905,8 +2904,6 @@ def _source_rule_summary(row: sqlite3.Row) -> dict:
         "sync_status": row["last_sync_status"] or "ok",
         "sync_error_summary": row["last_sync_error_summary"] or "",
         "sync_error_detail": row["last_sync_error_detail"] or "",
-        "sync_last_error_at": row["last_sync_error_at"] or "",
-        "sync_last_success_at": row["last_sync_success_at"] or "",
     }
 
 
@@ -2914,8 +2911,7 @@ def _source_rule_health(db: sqlite3.Connection, source_email: str) -> dict:
     row = db.execute(
         """
         SELECT last_sync_status, last_sync_error_summary,
-               last_sync_error_detail, last_sync_error_at,
-               last_sync_success_at
+               last_sync_error_detail
         FROM source_rules
         WHERE email=?
         """,
@@ -2926,15 +2922,11 @@ def _source_rule_health(db: sqlite3.Connection, source_email: str) -> dict:
             "sync_status": "ok",
             "sync_error_summary": "",
             "sync_error_detail": "",
-            "sync_last_error_at": "",
-            "sync_last_success_at": "",
         }
     return {
         "sync_status": row["last_sync_status"] or "ok",
         "sync_error_summary": row["last_sync_error_summary"] or "",
         "sync_error_detail": row["last_sync_error_detail"] or "",
-        "sync_last_error_at": row["last_sync_error_at"] or "",
-        "sync_last_success_at": row["last_sync_success_at"] or "",
     }
 
 
