@@ -575,10 +575,7 @@ function sourceUidText(row) {
 }
 
 function mailTimeText(row) {
-  return (
-    String(row.mail_time || row.internal_date || row.updated_at || '').trim() ||
-    '-'
-  );
+  return formatEastEightTime(mailTimeRaw(row)) || '-';
 }
 
 function sortByMailTime(left, right) {
@@ -586,8 +583,54 @@ function sortByMailTime(left, right) {
 }
 
 function mailTimeValue(row) {
-  const value = Date.parse(mailTimeText(row));
+  const value = parseMailTimestamp(mailTimeRaw(row));
   return Number.isFinite(value) ? value : 0;
+}
+
+function mailTimeRaw(row) {
+  return String(
+    row.mail_time || row.internal_date || row.updated_at || '',
+  ).trim();
+}
+
+function formatEastEightTime(value) {
+  const timestamp = parseMailTimestamp(value);
+  if (!Number.isFinite(timestamp)) return String(value || '').trim();
+  const eastEight = new Date(timestamp + 8 * 60 * 60 * 1000);
+  return `${datePartsFromUtc(eastEight)} ${timePartsFromUtc(eastEight)} UTC+8`;
+}
+
+function parseMailTimestamp(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return Number.NaN;
+  const normalized = hasExplicitTimezone(raw)
+    ? raw
+    : raw.replace(' ', 'T') + 'Z';
+  return Date.parse(normalized);
+}
+
+function hasExplicitTimezone(value) {
+  return /(?:z|[+-]\d{2}:?\d{2})$/i.test(value);
+}
+
+function datePartsFromUtc(value) {
+  return [
+    value.getUTCFullYear(),
+    padTimePart(value.getUTCMonth() + 1),
+    padTimePart(value.getUTCDate()),
+  ].join('-');
+}
+
+function timePartsFromUtc(value) {
+  return [
+    padTimePart(value.getUTCHours()),
+    padTimePart(value.getUTCMinutes()),
+    padTimePart(value.getUTCSeconds()),
+  ].join(':');
+}
+
+function padTimePart(value) {
+  return String(value).padStart(2, '0');
 }
 
 function logErrorText(row) {
