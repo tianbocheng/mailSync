@@ -58,8 +58,8 @@ const props = defineProps({
 
 const emit = defineEmits(["login"]);
 
-const username = ref("admin");
-const password = ref("TEST_ADMIN_PASSWORD");
+const username = ref("");
+const password = ref("");
 const submitting = ref(false);
 const serverError = ref("");
 

@@ -1,5 +1,6 @@
 services:
   mail-sync:
+    image: lantian-mail-sync:latest
     build:
       context: ..
       dockerfile: deploy/Dockerfile
@@ -14,38 +15,16 @@ services:
       TZ: Asia/Shanghai
       MAIL_SYNC_STATE_DB: /app/data/mail_sync_state.sqlite3
       MAIL_SYNC_LOG_DIR: /app/logs
+      MAIL_SYNC_WEB_PORT: ${MAIL_SYNC_WEB_PORT:-24000}
       SYNC_INTERVAL: ${SYNC_INTERVAL:-900}
       SYNC_POLL_INTERVAL: ${SYNC_POLL_INTERVAL:-3}
       SYNC_BATCH_SIZE: ${SYNC_BATCH_SIZE:-5}
-    volumes:
-      - ../data:/app/data
-      - ../logs:/app/logs
-    tmpfs:
-      - /tmp
-    stop_grace_period: 30s
-
-  mail-sync-web:
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile
-    restart: unless-stopped
-    init: true
-    read_only: true
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
-    command: ["serve", "--host", "0.0.0.0", "--port", "8080"]
-    environment:
-      TZ: Asia/Shanghai
-      MAIL_SYNC_STATE_DB: /app/data/mail_sync_state.sqlite3
-      MAIL_SYNC_LOG_DIR: /app/logs
-      MAIL_SYNC_WEB_PORT: ${MAIL_SYNC_WEB_PORT:-8080}
+    command: ["run", "--host", "0.0.0.0"]
     volumes:
       - ../data:/app/data
       - ../logs:/app/logs
     ports:
-      - "${MAIL_SYNC_WEB_PORT:-8080}:8080"
+      - "${MAIL_SYNC_WEB_PORT:-24000}:${MAIL_SYNC_WEB_PORT:-24000}"
     tmpfs:
       - /tmp
-    stop_grace_period: 10s
+    stop_grace_period: 30s

@@ -30,7 +30,7 @@ python3 backend/mail_sync.py import-config backend/config/config.json
 启动 Web 管理控制台：
 
 ```bash
-python3 backend/mail_sync.py serve --host 127.0.0.1 --port 8080
+python3 backend/mail_sync.py serve --host 127.0.0.1 --port 24000
 ```
 
 首次初始化数据库时会创建 `admin` 管理员用户。默认用户名和密码可通过
@@ -204,16 +204,17 @@ SYNC_INTERVAL=900 python3 backend/mail_sync.py watch
 docker compose -f deploy/compose.yaml up -d --build
 ```
 
-查看同步日志：
+查看容器日志：
 
 ```bash
 docker compose -f deploy/compose.yaml logs -f mail-sync
 ```
 
-查看 Web 控制台日志：
+Web 控制台和同步子进程会分别写入挂载日志目录：
 
 ```bash
-docker compose -f deploy/compose.yaml logs -f mail-sync-web
+tail -f logs/web.log
+tail -f logs/sync.log
 ```
 
 停止服务：
@@ -233,7 +234,7 @@ npm run build
 开发前端时，先启动后端：
 
 ```bash
-python3 backend/mail_sync.py serve --host 127.0.0.1 --port 8080
+python3 backend/mail_sync.py serve --host 127.0.0.1 --port 24000
 ```
 
 再启动 Vite：

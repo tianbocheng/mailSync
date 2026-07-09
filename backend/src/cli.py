@@ -1099,8 +1099,8 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument(
         "--port",
         type=int,
-        default=int(os.environ.get("MAIL_SYNC_WEB_PORT", "8080")),
-        help="Web console bind port (default: 8080)",
+        default=int(os.environ.get("MAIL_SYNC_WEB_PORT", "24000")),
+        help="Web console bind port (default: 24000)",
     )
     run_parser = subparsers.add_parser(
         "run",
@@ -1114,8 +1114,8 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument(
         "--port",
         type=int,
-        default=int(os.environ.get("MAIL_SYNC_WEB_PORT", "8080")),
-        help="Web console bind port (default: 8080)",
+        default=int(os.environ.get("MAIL_SYNC_WEB_PORT", "24000")),
+        help="Web console bind port (default: 24000)",
     )
     run_parser.add_argument(
         "--log-dir",

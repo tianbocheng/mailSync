@@ -1762,6 +1762,9 @@ def _rows_with_sync_metadata(
     for row in rows:
         item = {key: row[key] for key in row.keys()}
         source_folder = str(item.get("source_folder") or "")
+        item["mail_time"] = str(
+            item.get("internal_date") or item.get("updated_at") or ""
+        )
         item["sync_source"] = _sync_rule_log_source(item, sync_source_context)
         item["target_folder"] = (
             str(item.get("target_folder") or "")
@@ -2135,7 +2138,9 @@ def recent_messages(
                last_sync_action, last_sync_source, updated_at
         FROM messages
         {where}
-        ORDER BY updated_at DESC
+        ORDER BY julianday(COALESCE(NULLIF(internal_date, ''), updated_at)) DESC,
+                 COALESCE(NULLIF(internal_date, ''), updated_at) DESC,
+                 updated_at DESC
         LIMIT ? OFFSET ?
         """,
         params,
@@ -2215,7 +2220,9 @@ def pending_operations(
                last_sync_source, updated_at
         FROM pending_operations
         {where}
-        ORDER BY updated_at DESC
+        ORDER BY julianday(COALESCE(NULLIF(internal_date, ''), updated_at)) DESC,
+                 COALESCE(NULLIF(internal_date, ''), updated_at) DESC,
+                 updated_at DESC
         LIMIT ? OFFSET ?
         """,
         params,

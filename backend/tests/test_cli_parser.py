@@ -42,7 +42,7 @@ class ParserDefaultsTests(unittest.TestCase):
             args = mail_sync.build_parser().parse_args(["run"])
 
         self.assertEqual(args.host, "127.0.0.1")
-        self.assertEqual(args.port, 8080)
+        self.assertEqual(args.port, 24000)
         self.assertEqual(args.interval, mail_sync.DEFAULT_SYNC_INTERVAL_SECONDS)
         self.assertEqual(args.poll_interval, 3)
 

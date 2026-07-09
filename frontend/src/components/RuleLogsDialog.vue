@@ -70,6 +70,7 @@
             <el-table
               :data="logs.success"
               :row-key="logRowKey"
+              :default-sort="defaultTimeSort"
               empty-text="暂无成功记录"
               @selection-change="
                 (rows) => handleSelectionChange('success', rows)
@@ -80,7 +81,13 @@
                 width="48"
                 :selectable="isSelectableLog"
               />
-              <el-table-column label="时间" min-width="150">
+              <el-table-column
+                prop="mail_time"
+                label="时间"
+                min-width="150"
+                sortable
+                :sort-method="sortByMailTime"
+              >
                 <template #default="{ row }">
                   <div class="log-multiline-cell" :title="mailTimeText(row)">
                     <span>{{ datePart(mailTimeText(row)) }}</span>
@@ -172,6 +179,7 @@
             <el-table
               :data="logs.failed"
               :row-key="logRowKey"
+              :default-sort="defaultTimeSort"
               empty-text="暂无失败记录"
               @selection-change="
                 (rows) => handleSelectionChange('failed', rows)
@@ -182,7 +190,13 @@
                 width="48"
                 :selectable="isSelectableLog"
               />
-              <el-table-column label="时间" min-width="150">
+              <el-table-column
+                prop="mail_time"
+                label="时间"
+                min-width="150"
+                sortable
+                :sort-method="sortByMailTime"
+              >
                 <template #default="{ row }">
                   <div class="log-multiline-cell" :title="mailTimeText(row)">
                     <span>{{ datePart(mailTimeText(row)) }}</span>
@@ -317,6 +331,7 @@ const filterKeyword = ref('');
 const appliedKeyword = ref('');
 const pageSizeOptions = [10, 20, 50, 100];
 const pageSize = ref(10);
+const defaultTimeSort = { prop: 'mail_time', order: 'descending' };
 const logs = ref({
   success: [],
   failed: [],
@@ -560,7 +575,19 @@ function sourceUidText(row) {
 }
 
 function mailTimeText(row) {
-  return String(row.internal_date || row.updated_at || '').trim() || '-';
+  return (
+    String(row.mail_time || row.internal_date || row.updated_at || '').trim() ||
+    '-'
+  );
+}
+
+function sortByMailTime(left, right) {
+  return mailTimeValue(left) - mailTimeValue(right);
+}
+
+function mailTimeValue(row) {
+  const value = Date.parse(mailTimeText(row));
+  return Number.isFinite(value) ? value : 0;
 }
 
 function logErrorText(row) {

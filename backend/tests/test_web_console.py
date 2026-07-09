@@ -2603,6 +2603,141 @@ class WebConsoleTests(unittest.TestCase):
             finally:
                 db.close()
 
+    def test_sync_rule_logs_default_order_uses_mail_time_desc(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.sqlite3"
+            db = mail_sync.init_db(state_path)
+            try:
+                import_legacy_config(db, self.valid_config())
+                newer_raw = b"Subject: newer-success\r\n\r\nbody\r\n"
+                older_raw = b"Subject: older-success\r\n\r\nbody\r\n"
+                for raw, uid, internal_date in (
+                    (
+                        newer_raw,
+                        10,
+                        datetime(2025, 2, 1, 0, 0, 0, tzinfo=timezone.utc),
+                    ),
+                    (
+                        older_raw,
+                        11,
+                        datetime(2025, 1, 1, 0, 0, 0, tzinfo=timezone.utc),
+                    ),
+                ):
+                    message = mail_sync.SourceMessage(
+                        source_email="source@example.com",
+                        folder="INBOX",
+                        uidvalidity=1,
+                        uid=uid,
+                        raw=raw,
+                        content_hash=mail_sync.content_hash(raw),
+                        message_id=f"<{uid}@example.com>",
+                        internal_date=internal_date,
+                        system_flags=(),
+                    )
+                    mail_sync.upsert_state(
+                        db,
+                        message,
+                        2,
+                        uid + 20,
+                        "SYNC:source@example.com",
+                        ("BOX:收件箱",),
+                        "run-id",
+                        sync_action="created",
+                        target_folder="INBOX",
+                    )
+                db.execute(
+                    """
+                    UPDATE messages SET updated_at=?
+                    WHERE content_hash=?
+                    """,
+                    (
+                        "2026-01-01T00:00:00+00:00",
+                        mail_sync.content_hash(newer_raw),
+                    ),
+                )
+                db.execute(
+                    """
+                    UPDATE messages SET updated_at=?
+                    WHERE content_hash=?
+                    """,
+                    (
+                        "2026-01-02T00:00:00+00:00",
+                        mail_sync.content_hash(older_raw),
+                    ),
+                )
+                pending_rows = (
+                    (
+                        b"Subject: newer-failed\r\n\r\nbody\r\n",
+                        "newer-failed",
+                        "2025-02-01T00:00:00+00:00",
+                        "2026-01-01T00:00:00+00:00",
+                        12,
+                    ),
+                    (
+                        b"Subject: older-failed\r\n\r\nbody\r\n",
+                        "older-failed",
+                        "2025-01-01T00:00:00+00:00",
+                        "2026-01-02T00:00:00+00:00",
+                        13,
+                    ),
+                )
+                for raw, subject, internal_date, updated_at, uid in pending_rows:
+                    db.execute(
+                        """
+                        INSERT INTO pending_operations (
+                            source_email, content_hash, message_id, subject,
+                            source_folder, source_uidvalidity, source_uid,
+                            source_flags, internal_date, raw_message,
+                            account_label, folder_label, folder_labels_json,
+                            old_target_uid, target_folder, target_uidvalidity,
+                            target_uid_before, new_target_uid, status,
+                            last_error, created_at, updated_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                                ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            "source@example.com",
+                            mail_sync.content_hash(raw),
+                            f"<{uid}@example.com>",
+                            subject,
+                            "INBOX",
+                            1,
+                            uid,
+                            "[]",
+                            internal_date,
+                            raw,
+                            "SYNC:source@example.com",
+                            "BOX:收件箱",
+                            json.dumps(["BOX:收件箱"], ensure_ascii=False),
+                            None,
+                            "INBOX",
+                            2,
+                            uid + 20,
+                            None,
+                            "pending",
+                            "network timeout",
+                            updated_at,
+                            updated_at,
+                        ),
+                    )
+                db.commit()
+
+                logs = sync_rule_logs(db, "source@example.com")
+
+                self.assertEqual(logs["success"][0]["subject"], "newer-success")
+                self.assertEqual(
+                    logs["success"][0]["mail_time"],
+                    "2025-02-01T00:00:00+00:00",
+                )
+                self.assertEqual(logs["failed"][0]["subject"], "newer-failed")
+                self.assertEqual(
+                    logs["failed"][0]["mail_time"],
+                    "2025-02-01T00:00:00+00:00",
+                )
+            finally:
+                db.close()
+
     def test_sync_rule_logs_lock_source_and_target_identity(self):
         with tempfile.TemporaryDirectory() as directory:
             state_path = Path(directory) / "state.sqlite3"
