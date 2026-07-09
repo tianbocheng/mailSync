@@ -1,0 +1,248 @@
+:root {
+  --app-bg: #f5f6fa;
+  --surface: #ffffff;
+  --surface-soft: #f6f7fc;
+  --header-soft: #f2f3f8;
+  --line: #ebeef5;
+  --line-strong: #e3e7ef;
+  --text: #263241;
+  --text-strong: #172033;
+  --muted: #7d8796;
+  --primary: #1677ff;
+  --primary-hover: #0f66db;
+  --success: #11b36a;
+  color: var(--text);
+  background: var(--app-bg);
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+    "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  --el-color-primary: var(--primary);
+  --el-color-primary-light-3: #4f9cff;
+  --el-color-primary-light-5: #8fc1ff;
+  --el-color-primary-light-7: #c3ddff;
+  --el-color-primary-light-9: #ecf5ff;
+  --el-border-radius-base: 2px;
+  --el-font-size-base: 12px;
+  --el-font-size-small: 12px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  background: var(--app-bg);
+  font-size: 12px;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+.page {
+  display: grid;
+  gap: 12px;
+}
+
+.page-card {
+  min-height: calc(100vh - 4px);
+  border: 1px solid var(--line-strong);
+  border-top: 0;
+  box-shadow: 0 10px 26px rgba(20, 31, 50, 0.08);
+}
+
+.page-card > .el-card__body {
+  padding: 20px 20px 16px;
+}
+
+.page-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 28px;
+  margin-bottom: 18px;
+}
+
+.page-heading h2 {
+  margin: 0;
+  color: var(--text-strong);
+  font-size: 16px;
+  font-weight: 600;
+  line-height: 1.3;
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 14px;
+}
+
+.toolbar-actions,
+.filter-row,
+.table-actions,
+.form-actions,
+.inline-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.filter-row {
+  justify-content: flex-end;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.strong-cell {
+  display: grid;
+}
+
+.strong-cell strong {
+  color: #4f5867;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.strong-cell small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.result-box {
+  margin-top: 12px;
+}
+
+.el-button {
+  min-width: 56px;
+  height: 28px;
+  padding: 0 14px;
+  border-radius: 2px;
+  font-size: 12px;
+  font-weight: 400;
+}
+
+.el-button--primary {
+  --el-button-bg-color: var(--primary);
+  --el-button-border-color: var(--primary);
+  --el-button-hover-bg-color: var(--primary-hover);
+  --el-button-hover-border-color: var(--primary-hover);
+}
+
+.el-button.is-link {
+  min-width: auto;
+  height: auto;
+  padding: 0;
+  font-size: 12px;
+}
+
+.el-input {
+  --el-input-height: 28px;
+  font-size: 12px;
+}
+
+.el-input__wrapper,
+.el-select__wrapper {
+  min-height: 28px;
+  border-radius: 2px;
+  background: #f7f8fc;
+  box-shadow: 0 0 0 1px transparent inset;
+}
+
+.el-form--inline .el-form-item {
+  margin-right: 8px;
+  margin-bottom: 0;
+}
+
+.el-form-item__label {
+  color: #3f4755;
+  font-size: 12px;
+}
+
+.el-form--inline .el-form-item__label {
+  padding-right: 6px;
+}
+
+.el-table {
+  --el-table-border-color: var(--line);
+  --el-table-header-bg-color: var(--header-soft);
+  --el-table-header-text-color: #2f3745;
+  --el-table-row-hover-bg-color: #f8fbff;
+  color: #505967;
+  border: 1px solid var(--line);
+  border-bottom: 0;
+  font-size: 12px;
+}
+
+.el-table th.el-table__cell {
+  height: 42px;
+  background: var(--header-soft);
+  font-weight: 600;
+}
+
+.el-table .el-table__cell {
+  padding: 0;
+}
+
+.el-table .cell {
+  line-height: 18px;
+  padding: 0 16px;
+}
+
+.el-table__row {
+  height: 40px;
+}
+
+.table-footer {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 12px;
+  min-height: 46px;
+  padding-top: 10px;
+  color: #4f5867;
+}
+
+.table-footer .el-pagination {
+  --el-pagination-button-width: 28px;
+  --el-pagination-button-height: 28px;
+  --el-pagination-font-size: 12px;
+  font-weight: 400;
+}
+
+.table-footer .el-pagination .el-pager li {
+  border-radius: 2px;
+}
+
+.table-footer .el-pagination .el-pager li.is-active {
+  color: var(--primary);
+  background: #eaf4ff;
+}
+
+.table-footer .el-select {
+  width: 92px;
+}
+
+@media (max-width: 900px) {
+  .toolbar,
+  .page-heading {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .filter-row {
+    justify-content: flex-start;
+  }
+}

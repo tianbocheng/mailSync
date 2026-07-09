@@ -5,10 +5,13 @@ __pycache__/
 *outlook*token*.json
 config.json
 config/config.json
+backend/config/config.json
 mail_sync_state.sqlite3
-data/mail_sync_state.sqlite3
+data/
+logs/
 *.log
 backups/
+frontend/node_modules/
 
 # Runtime sidecars
 mail_sync_state.sqlite3-*

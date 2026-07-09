@@ -1,0 +1,11 @@
+backend/config/config.json
+__pycache__/
+*.pyc
+.git/
+.DS_Store
+frontend/node_modules/
+data/
+logs/
+deploy/*.sqlite3
+deploy/*.sqlite3-*
+deploy/*.sqlite3.lock
