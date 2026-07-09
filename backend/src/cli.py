@@ -333,7 +333,43 @@ def command_sync(
                                     profiles[email],
                                 )
                             except SourceMessageUnavailable as exc:
-                                action = "source_message_skipped"
+                                if known is not None:
+                                    db.execute(
+                                        """
+                                        UPDATE message_locations
+                                        SET last_seen_run=?, updated_at=?
+                                        WHERE source_email=? AND source_folder=?
+                                          AND source_uidvalidity=? AND source_uid=?
+                                        """,
+                                        (
+                                            run_id,
+                                            now_iso(),
+                                            email,
+                                            folder.raw_name,
+                                            uidvalidity,
+                                            uid,
+                                        ),
+                                    )
+                                    db.execute(
+                                        """
+                                        UPDATE messages SET
+                                            last_sync_action=?,
+                                            last_sync_source=?,
+                                            last_seen_run=?, updated_at=?
+                                        WHERE source_email=? AND content_hash=?
+                                        """,
+                                        (
+                                            "source_message_unavailable_seen",
+                                            sync_source,
+                                            run_id,
+                                            now_iso(),
+                                            email,
+                                            known["content_hash"],
+                                        ),
+                                    )
+                                    action = "source_message_unavailable_seen"
+                                else:
+                                    action = "source_message_skipped"
                                 summary[action] = summary.get(action, 0) + 1
                                 total_scanned += 1
                                 emit_json(

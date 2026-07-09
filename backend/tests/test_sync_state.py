@@ -1469,6 +1469,157 @@ class TargetIdentityTests(unittest.TestCase):
             )
             db.close()
 
+
+class SourceUnavailableSeenTests(unittest.TestCase):
+    def test_known_unavailable_source_uid_keeps_location_seen(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.sqlite3"
+            db = mail_sync.init_db(state_path)
+            raw = b"Subject: unavailable\r\n\r\nbody\r\n"
+            message = mail_sync.SourceMessage(
+                source_email="source@example.com",
+                folder="INBOX",
+                uidvalidity=1,
+                uid=10,
+                raw=raw,
+                content_hash=mail_sync.content_hash(raw),
+                message_id="<unavailable@example.com>",
+                internal_date=datetime(2024, 1, 1, tzinfo=timezone.utc),
+                system_flags=(),
+            )
+            mail_sync.upsert_state(
+                db,
+                message,
+                2,
+                20,
+                "SYNC:source@example.com",
+                ("BOX:收件箱",),
+                "old-run",
+                target_folder="INBOX",
+                target_email="target@example.com",
+                target_service_address="imap.target",
+            )
+            mail_sync.upsert_message_location(
+                db,
+                message,
+                "BOX:收件箱",
+                "old-run",
+            )
+            db.execute(
+                """
+                UPDATE messages
+                SET source_date_verified=0
+                WHERE source_email=? AND content_hash=?
+                """,
+                (message.source_email, message.content_hash),
+            )
+            db.commit()
+            db.close()
+
+            target = {
+                "email": "target@example.com",
+                "service_address": "imap.target",
+                "folder": "INBOX",
+            }
+            config = {
+                "target": target,
+                "synology_labels": {
+                    "$account": "SYNC:source@example.com",
+                    "$inbox": "BOX:收件箱",
+                },
+                "sources": [
+                    {
+                        "email": "source@example.com",
+                        "account_label": "SYNC:source@example.com",
+                        "default_folder_label": "BOX:收件箱",
+                    }
+                ],
+            }
+            profiles = {
+                "source@example.com": {"email": "source@example.com"},
+                "target@example.com": target,
+            }
+            labels_by_name = {
+                "SYNC:source@example.com": "$account",
+                "BOX:收件箱": "$inbox",
+            }
+
+            with (
+                mock.patch.object(
+                    mail_sync,
+                    "connect",
+                    side_effect=[mock.Mock(), mock.Mock()],
+                ),
+                mock.patch.object(
+                    mail_sync,
+                    "recover_pending_operations",
+                    return_value=0,
+                ),
+                mock.patch.object(
+                    mail_sync,
+                    "list_folders",
+                    return_value=[mail_sync.FolderInfo("INBOX", "INBOX", ())],
+                ),
+                mock.patch.object(
+                    mail_sync,
+                    "select_mailbox",
+                    return_value=(1, 1),
+                ),
+                mock.patch.object(mail_sync, "search_uids", return_value=[10]),
+                mock.patch.object(
+                    mail_sync,
+                    "fetch_source_message",
+                    side_effect=mail_sync.SourceMessageUnavailable(
+                        "Source message has no fetchable body"
+                    ),
+                ),
+                mock.patch.object(
+                    mail_sync,
+                    "reconcile_deleted_messages",
+                    return_value=0,
+                ),
+            ):
+                mail_sync.command_sync(
+                    config,
+                    profiles,
+                    labels_by_name,
+                    state_path,
+                    "source@example.com",
+                    None,
+                    None,
+                    True,
+                )
+
+            db = mail_sync.init_db(state_path)
+            try:
+                location = db.execute(
+                    """
+                    SELECT last_seen_run
+                    FROM message_locations
+                    WHERE source_email=? AND content_hash=?
+                    """,
+                    (message.source_email, message.content_hash),
+                ).fetchone()
+                row = db.execute(
+                    """
+                    SELECT last_sync_action, last_seen_run
+                    FROM messages
+                    WHERE source_email=? AND content_hash=?
+                    """,
+                    (message.source_email, message.content_hash),
+                ).fetchone()
+            finally:
+                db.close()
+
+            self.assertIsNotNone(location)
+            self.assertNotEqual(location["last_seen_run"], "old-run")
+            self.assertEqual(
+                row["last_sync_action"],
+                "source_message_unavailable_seen",
+            )
+            self.assertNotEqual(row["last_seen_run"], "old-run")
+
+
 class PendingMultiLabelTests(unittest.TestCase):
     def test_pending_operation_falls_back_to_search_when_uidnext_is_invalid(self):
         with tempfile.TemporaryDirectory() as directory:

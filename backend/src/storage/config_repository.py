@@ -1912,6 +1912,7 @@ def _sync_rule_log_action_remark(value: object) -> str:
         "source_out_of_scope": "来源已移出同步范围",
         "source_out_of_scope_labeled": "来源已移出同步范围",
         "source_out_of_scope_deleted": "目标已同步删除",
+        "source_message_unavailable_seen": "源邮件本轮可见但内容不可读",
         "pending_operation_recovered": "失败恢复",
         "source_labels_rebuilt": "源标签修复",
     }.get(str(value or ""), "")

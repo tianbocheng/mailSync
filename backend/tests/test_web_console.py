@@ -2603,6 +2603,43 @@ class WebConsoleTests(unittest.TestCase):
             finally:
                 db.close()
 
+    def test_sync_rule_logs_note_source_unavailable_seen(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.sqlite3"
+            db = mail_sync.init_db(state_path)
+            try:
+                import_legacy_config(db, self.valid_config())
+                raw = b"Subject: unavailable\r\n\r\nbody\r\n"
+                message = mail_sync.SourceMessage(
+                    source_email="source@example.com",
+                    folder="INBOX",
+                    uidvalidity=1,
+                    uid=10,
+                    raw=raw,
+                    content_hash=mail_sync.content_hash(raw),
+                    message_id="<unavailable@example.com>",
+                    internal_date=None,
+                    system_flags=(),
+                )
+                mail_sync.upsert_state(
+                    db,
+                    message,
+                    2,
+                    20,
+                    "SYNC:source@example.com",
+                    ("BOX:收件箱",),
+                    "run-id",
+                    sync_action="source_message_unavailable_seen",
+                    target_folder="INBOX",
+                )
+                db.commit()
+
+                logs = sync_rule_logs(db, "source@example.com")
+                remarks = logs["success"][0]["remarks"]
+                self.assertIn("源邮件本轮可见但内容不可读", remarks)
+            finally:
+                db.close()
+
     def test_sync_rule_logs_default_order_uses_mail_time_desc(self):
         with tempfile.TemporaryDirectory() as directory:
             state_path = Path(directory) / "state.sqlite3"
