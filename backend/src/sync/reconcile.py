@@ -5,7 +5,7 @@ import json
 import sqlite3
 from datetime import datetime
 from email import message_from_bytes
-from typing import Dict
+from typing import Dict, Set, Tuple
 
 from common.clock import now_iso
 from common.errors import SyncError
@@ -58,6 +58,7 @@ def reconcile_deleted_messages(
     target_email: str = "",
     target_service_address: str = "",
     rebuild_limit: int | None = None,
+    preserved_source_folders: Set[Tuple[str, int]] | None = None,
 ) -> int:
     """Reconcile the exact target label set from all current source locations."""
     source_email = source_rule["email"]
@@ -69,10 +70,44 @@ def reconcile_deleted_messages(
         target_email,
         target_service_address,
     )
+    preserved_source_folders = preserved_source_folders or set()
+    preserve_filter = ""
+    if preserved_source_folders:
+        db.execute(
+            """
+            CREATE TEMP TABLE IF NOT EXISTS preserved_source_folders (
+                source_folder TEXT NOT NULL,
+                source_uidvalidity INTEGER NOT NULL,
+                PRIMARY KEY (source_folder, source_uidvalidity)
+            )
+            """
+        )
+        db.execute("DELETE FROM preserved_source_folders")
+        db.executemany(
+            """
+            INSERT OR IGNORE INTO preserved_source_folders (
+                source_folder, source_uidvalidity
+            ) VALUES (?, ?)
+            """,
+            (
+                (folder, int(uidvalidity))
+                for folder, uidvalidity in preserved_source_folders
+            ),
+        )
+        preserve_filter = """
+          AND NOT EXISTS (
+              SELECT 1
+              FROM preserved_source_folders AS preserved
+              WHERE preserved.source_folder=message_locations.source_folder
+                AND preserved.source_uidvalidity=
+                    message_locations.source_uidvalidity
+          )
+        """
     db.execute(
         f"""
         DELETE FROM message_locations
         WHERE source_email=? AND last_seen_run<>?
+          {preserve_filter}
           AND content_hash IN (
               SELECT content_hash
               FROM messages

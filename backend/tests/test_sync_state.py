@@ -1757,7 +1757,7 @@ class FolderWatermarkScanTests(unittest.TestCase):
             finally:
                 db.close()
             self.assertIsNotNone(location)
-            self.assertNotEqual(location["last_seen_run"], "old-run")
+            self.assertEqual(location["last_seen_run"], "old-run")
 
 
 class PendingMultiLabelTests(unittest.TestCase):

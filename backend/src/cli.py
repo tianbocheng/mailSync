@@ -92,7 +92,6 @@ from sync.incremental import (
     bulk_mark_locations_seen,
     folder_scan_state_unchanged,
     incremental_candidate_uids,
-    mark_folder_locations_seen,
     upsert_folder_scan_state,
     verified_known_location_uids,
 )
@@ -206,6 +205,7 @@ def command_sync(
             source_changed = 0
             source_processed = 0
             source_scan_complete = True
+            watermark_unchanged_folders: Set[Tuple[str, int]] = set()
             source = connect(profiles[email])
             try:
                 folders = selectable_source_folders(list_folders(source), rule)
@@ -267,24 +267,13 @@ def command_sync(
                                 target_service_address,
                             )
                         ):
-                            seen_count = mark_folder_locations_seen(
-                                db,
-                                email,
-                                folder.raw_name,
-                                folder_status[0],
-                                run_id,
-                                target_email,
-                                target_service_address,
+                            watermark_unchanged_folders.add(
+                                (folder.raw_name, int(folder_status[0]))
                             )
                             summary["folder_watermark_unchanged"] = (
                                 summary.get("folder_watermark_unchanged", 0)
                                 + 1
                             )
-                            summary["folder_watermark_seen"] = (
-                                summary.get("folder_watermark_seen", 0)
-                                + seen_count
-                            )
-                            db.commit()
                             continue
                     _, uidvalidity = select_mailbox(
                         source,
@@ -568,17 +557,30 @@ def command_sync(
                         break
 
                 if only_folder is None and source_scan_complete:
-                    rebuilt_deleted = reconcile_deleted_messages(
-                        db,
-                        target,
-                        target_rule["folder"],
-                        rule,
-                        rule_labels_by_name,
-                        run_id,
-                        target_email,
-                        target_service_address,
-                        rebuild_limit=limit,
-                    )
+                    if (
+                        watermark_unchanged_folders
+                        and len(watermark_unchanged_folders) == len(folders)
+                        and source_changed == 0
+                        and source_processed == 0
+                    ):
+                        rebuilt_deleted = 0
+                        summary["reconciliation_watermark_skipped"] = (
+                            summary.get("reconciliation_watermark_skipped", 0)
+                            + 1
+                        )
+                    else:
+                        rebuilt_deleted = reconcile_deleted_messages(
+                            db,
+                            target,
+                            target_rule["folder"],
+                            rule,
+                            rule_labels_by_name,
+                            run_id,
+                            target_email,
+                            target_service_address,
+                            rebuild_limit=limit,
+                            preserved_source_folders=watermark_unchanged_folders,
+                        )
                     if rebuilt_deleted:
                         summary["source_deleted_rebuilt"] = (
                             summary.get("source_deleted_rebuilt", 0)
