@@ -88,6 +88,7 @@
       />
       <OutlookPanel
         v-else-if="dialog === 'outlook' || (dialog === 'edit' && isOutlookMailbox(mailbox))"
+        :detail="detail"
         :mailbox="mailbox"
       />
       <MailboxForm
