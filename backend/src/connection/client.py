@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import imaplib
+import os
 
 from auth.oauth import authenticate_oauth
 from common.errors import SyncError
@@ -15,6 +16,9 @@ NETEASE_IMAP_SERVERS = {
     "imap.126.com",
     "imap.yeah.net",
 }
+DEFAULT_IMAP_TIMEOUT_SECONDS = float(
+    os.environ.get("IMAP_TIMEOUT_SECONDS", "60")
+)
 
 
 class ProxiedIMAP4(imaplib.IMAP4):
@@ -66,9 +70,7 @@ def connect(profile: dict) -> imaplib.IMAP4:
     host = profile["imap_server"]
     port = int(profile.get("imap_port", 993 if profile.get("use_ssl", True) else 143))
     proxy = profile_imap_proxy(profile)
-    timeout = profile.get("imap_timeout")
-    if timeout is not None:
-        timeout = float(timeout)
+    timeout = _imap_timeout(profile)
     if profile.get("use_ssl", True):
         if proxy is not None:
             client: imaplib.IMAP4 = ProxiedIMAP4_SSL(
@@ -123,6 +125,16 @@ def connect(profile: dict) -> imaplib.IMAP4:
         except Exception:
             pass
     return client
+
+
+def _imap_timeout(profile: dict) -> float | None:
+    raw = profile.get("imap_timeout")
+    if raw in (None, ""):
+        return DEFAULT_IMAP_TIMEOUT_SECONDS
+    timeout = float(raw)
+    if timeout <= 0:
+        return None
+    return timeout
 
 
 def default_imap_identity(profile: dict) -> dict:

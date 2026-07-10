@@ -31,6 +31,46 @@ class FakeImap:
 
 
 class OAuthTests(unittest.TestCase):
+    def test_imap_connect_uses_default_timeout(self):
+        client = FakeImap()
+        profile = {
+            "email": "legacy@example.com",
+            "password": "secret",
+            "imap_server": "imap.example.com",
+        }
+        with (
+            mock.patch.object(
+                connection_module,
+                "DEFAULT_IMAP_TIMEOUT_SECONDS",
+                45.0,
+            ),
+            mock.patch.object(
+                connection_module.imaplib,
+                "IMAP4_SSL",
+                return_value=client,
+            ) as imap_ssl,
+        ):
+            result = mail_sync.connect(profile)
+        self.assertIs(result, client)
+        self.assertEqual(imap_ssl.call_args.kwargs["timeout"], 45.0)
+
+    def test_imap_connect_prefers_profile_timeout(self):
+        client = FakeImap()
+        profile = {
+            "email": "legacy@example.com",
+            "password": "secret",
+            "imap_server": "imap.example.com",
+            "imap_timeout": 12,
+        }
+        with mock.patch.object(
+            connection_module.imaplib,
+            "IMAP4_SSL",
+            return_value=client,
+        ) as imap_ssl:
+            result = mail_sync.connect(profile)
+        self.assertIs(result, client)
+        self.assertEqual(imap_ssl.call_args.kwargs["timeout"], 12.0)
+
     def test_password_login_remains_supported(self):
         client = FakeImap()
         profile = {
