@@ -22,8 +22,8 @@ class NeteaseImapIdTests(unittest.TestCase):
         client.xatom.return_value = ("OK", [b"id accepted"])
 
         with mock.patch.object(
-            connection_module.imaplib,
-            "IMAP4_SSL",
+            connection_module,
+            "DirectIMAP4_SSL",
             return_value=client,
         ):
             result = mail_sync.connect(
@@ -49,8 +49,8 @@ class NeteaseImapIdTests(unittest.TestCase):
         client.login.return_value = ("OK", [b"logged in"])
 
         with mock.patch.object(
-            connection_module.imaplib,
-            "IMAP4_SSL",
+            connection_module,
+            "DirectIMAP4_SSL",
             return_value=client,
         ):
             result = mail_sync.connect(
@@ -75,8 +75,8 @@ class NeteaseImapIdTests(unittest.TestCase):
         client.xatom.return_value = ("OK", [b"id accepted"])
 
         with mock.patch.object(
-            connection_module.imaplib,
-            "IMAP4_SSL",
+            connection_module,
+            "DirectIMAP4_SSL",
             return_value=client,
         ):
             result = mail_sync.connect(
@@ -100,8 +100,8 @@ class NeteaseImapIdTests(unittest.TestCase):
         client.login.return_value = ("OK", [b"logged in"])
 
         with mock.patch.object(
-            connection_module.imaplib,
-            "IMAP4_SSL",
+            connection_module,
+            "DirectIMAP4_SSL",
             return_value=client,
         ):
             result = mail_sync.connect(

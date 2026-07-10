@@ -63,6 +63,61 @@ class ParserDefaultsTests(unittest.TestCase):
         )
 
 
+class IncrementalRetryTests(unittest.TestCase):
+    def test_incremental_retry_uses_bounded_backoff(self):
+        pending = {}
+        change = {
+            "email": "source@example.com",
+            "folder": "INBOX",
+            "_queued_at": 90.0,
+            "_retry_attempt": 0,
+        }
+
+        with mock.patch.object(mail_sync.time, "monotonic", return_value=100.0):
+            for attempt, delay in enumerate(
+                mail_sync.INCREMENTAL_SYNC_RETRY_DELAYS,
+                start=1,
+            ):
+                retry = mail_sync._schedule_incremental_retry(pending, change)
+                self.assertEqual(retry, (attempt, delay))
+                change = pending.pop(("source@example.com", "INBOX"))
+                self.assertEqual(change["_retry_attempt"], attempt)
+                self.assertEqual(change["_retry_at"], 100.0 + delay)
+
+            self.assertIsNone(
+                mail_sync._schedule_incremental_retry(pending, change)
+            )
+            self.assertEqual(pending, {})
+
+    def test_pending_retry_waits_without_hiding_ready_change(self):
+        pending = {
+            ("retry@example.com", "INBOX"): {
+                "email": "retry@example.com",
+                "folder": "INBOX",
+                "_queued_at": 80.0,
+                "_retry_at": 105.0,
+            },
+            ("ready@example.com", "INBOX"): {
+                "email": "ready@example.com",
+                "folder": "INBOX",
+                "_queued_at": 90.0,
+                "_retry_at": 0.0,
+            },
+        }
+
+        self.assertEqual(
+            mail_sync._next_pending_change_time(pending, 100.0),
+            100.0,
+        )
+        ready = mail_sync._pop_ready_pending_change(pending, 100.0)
+        self.assertEqual(ready["email"], "ready@example.com")
+        self.assertIsNone(mail_sync._pop_ready_pending_change(pending, 104.0))
+        self.assertEqual(
+            mail_sync._next_pending_change_time(pending, 104.0),
+            105.0,
+        )
+
+
 class ScheduleRefreshTests(unittest.TestCase):
     def test_build_initial_schedule_uses_source_interval_for_staggering(self):
         rules = [

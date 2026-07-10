@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import errno
 import imaplib
 import os
+import selectors
+import socket
+import sys
+import time
 
 from auth.oauth import authenticate_oauth
 from common.errors import SyncError
@@ -19,6 +24,24 @@ NETEASE_IMAP_SERVERS = {
 DEFAULT_IMAP_TIMEOUT_SECONDS = float(
     os.environ.get("IMAP_TIMEOUT_SECONDS", "60")
 )
+DEFAULT_IMAP_CONNECT_TIMEOUT_SECONDS = float(
+    os.environ.get("IMAP_CONNECT_TIMEOUT_SECONDS", "10")
+)
+
+
+class DirectIMAP4(imaplib.IMAP4):
+    def _create_socket(self, timeout):
+        return _direct_imap_socket(self, timeout)
+
+
+class DirectIMAP4_SSL(imaplib.IMAP4_SSL):
+    def _create_socket(self, timeout):
+        sock = _direct_imap_socket(self, timeout)
+        try:
+            return self.ssl_context.wrap_socket(sock, server_hostname=self.host)
+        except Exception:
+            sock.close()
+            raise
 
 
 class ProxiedIMAP4(imaplib.IMAP4):
@@ -80,12 +103,12 @@ def connect(profile: dict) -> imaplib.IMAP4:
                 timeout=timeout,
             )
         else:
-            client = imaplib.IMAP4_SSL(host, port, timeout=timeout)
+            client = DirectIMAP4_SSL(host, port, timeout=timeout)
     else:
         if proxy is not None:
             client = ProxiedIMAP4(host, port, proxy, timeout=timeout)
         else:
-            client = imaplib.IMAP4(host, port, timeout=timeout)
+            client = DirectIMAP4(host, port, timeout=timeout)
     if oauth_settings(profile) is not None:
         authenticate_oauth(client, profile)
     else:
@@ -135,6 +158,120 @@ def _imap_timeout(profile: dict) -> float | None:
     if timeout <= 0:
         return None
     return timeout
+
+
+def _direct_imap_socket(
+    client: imaplib.IMAP4,
+    timeout: float | None,
+) -> socket.socket:
+    if timeout is not None and timeout <= 0:
+        raise ValueError("Non-blocking socket (timeout=0) is not supported")
+    host = None if not client.host else client.host
+    sys.audit("imaplib.open", client, client.host, client.port)
+    connect_timeout = _imap_connect_timeout(timeout)
+    sock = _race_direct_connection(host, client.port, connect_timeout)
+    sock.settimeout(timeout)
+    return sock
+
+
+def _imap_connect_timeout(read_timeout: float | None) -> float | None:
+    if read_timeout is None:
+        return None
+    return min(float(read_timeout), DEFAULT_IMAP_CONNECT_TIMEOUT_SECONDS)
+
+
+def _race_direct_connection(
+    host: str | None,
+    port: int,
+    timeout: float | None,
+) -> socket.socket:
+    if timeout is None:
+        return socket.create_connection((host, port))
+    if timeout <= 0:
+        raise ValueError("Connection timeout must be positive")
+
+    addresses = _direct_connection_addresses(host, port)
+    selector = selectors.DefaultSelector()
+    sockets: list[socket.socket] = []
+    errors: list[OSError] = []
+    winner: socket.socket | None = None
+    pending_codes = {
+        0,
+        errno.EINPROGRESS,
+        errno.EWOULDBLOCK,
+        errno.EALREADY,
+        errno.EINTR,
+        errno.EISCONN,
+    }
+    deadline = time.monotonic() + timeout
+    try:
+        for family, socktype, proto, sockaddr in addresses:
+            sock = socket.socket(family, socktype, proto)
+            sockets.append(sock)
+            sock.setblocking(False)
+            error_code = sock.connect_ex(sockaddr)
+            if error_code in {0, errno.EISCONN}:
+                winner = sock
+                break
+            if error_code not in pending_codes:
+                errors.append(OSError(error_code, os.strerror(error_code)))
+                sock.close()
+                continue
+            selector.register(sock, selectors.EVENT_WRITE)
+
+        while winner is None and selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            events = selector.select(remaining)
+            if not events:
+                break
+            for key, _ in events:
+                sock = key.fileobj
+                error_code = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                if error_code == 0:
+                    winner = sock
+                    break
+                errors.append(OSError(error_code, os.strerror(error_code)))
+                selector.unregister(sock)
+                sock.close()
+
+        if winner is None:
+            if selector.get_map():
+                raise TimeoutError(
+                    f"Timed out connecting to {host}:{port} after {timeout:g}s"
+                )
+            if errors:
+                raise errors[-1]
+            raise OSError(f"No usable address found for {host}:{port}")
+
+        winner.setblocking(True)
+        return winner
+    finally:
+        selector.close()
+        for sock in sockets:
+            if sock is not winner:
+                sock.close()
+
+
+def _direct_connection_addresses(
+    host: str | None,
+    port: int,
+) -> list[tuple[int, int, int, tuple]]:
+    addresses = []
+    seen = set()
+    for family, socktype, proto, _, sockaddr in socket.getaddrinfo(
+        host,
+        port,
+        0,
+        socket.SOCK_STREAM,
+    ):
+        key = (family, socktype, proto, sockaddr)
+        if key in seen:
+            continue
+        seen.add(key)
+        addresses.append((family, socktype, proto, sockaddr))
+    return addresses
 
 
 def default_imap_identity(profile: dict) -> dict:

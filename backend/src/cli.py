@@ -133,6 +133,7 @@ RUN_CHILD_STOP_TIMEOUT_SECONDS = 8.0
 MONITOR_UNCHANGED_FULL_SCAN_SKIP_SECONDS = int(
     os.environ.get("MONITOR_UNCHANGED_FULL_SCAN_SKIP_SECONDS", "600")
 )
+INCREMENTAL_SYNC_RETRY_DELAYS = (2.0, 5.0, 10.0)
 
 
 def _folder_scan_signature(
@@ -689,21 +690,29 @@ def command_watch(
                 time.sleep(1)
                 continue
             full_job = min(schedule, key=lambda item: item["next_run"])
+            now = time.monotonic()
+            wake_at = float(full_job["next_run"])
+            pending_wake_at = _next_pending_change_time(pending_changes, now)
+            if pending_wake_at is not None:
+                wake_at = min(wake_at, pending_wake_at)
             timeout = max(
                 0.0,
-                min(1.0, full_job["next_run"] - time.monotonic()),
+                min(1.0, wake_at - now),
             )
             try:
                 change = changes.get(timeout=timeout)
-                pending_changes[(change["email"], change["folder"])] = change
+                _enqueue_pending_change(pending_changes, change)
                 while True:
                     change = changes.get_nowait()
-                    pending_changes[(change["email"], change["folder"])] = change
+                    _enqueue_pending_change(pending_changes, change)
             except queue.Empty:
                 pass
 
-            if pending_changes:
-                _, change = pending_changes.popitem()
+            change = _pop_ready_pending_change(
+                pending_changes,
+                time.monotonic(),
+            )
+            if change is not None:
                 if change["email"] not in {rule["email"] for rule in rules}:
                     continue
                 cycle += 1
@@ -756,6 +765,10 @@ def command_watch(
                 ) as exc:
                     success = False
                     _record_watch_failure(state_path, change["email"], exc)
+                    retry = _schedule_incremental_retry(
+                        pending_changes,
+                        change,
+                    )
                     print(
                         json.dumps(
                             {
@@ -771,7 +784,27 @@ def command_watch(
                         file=sys.stderr,
                         flush=True,
                     )
+                    if retry is not None:
+                        retry_attempt, retry_delay = retry
+                        print(
+                            json.dumps(
+                                {
+                                    "event": "source_incremental_sync_retry_scheduled",
+                                    "cycle": cycle,
+                                    "source": change["email"],
+                                    "folder": change["folder"],
+                                    "attempt": retry_attempt,
+                                    "seconds": retry_delay,
+                                    "time": now_iso(),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            file=sys.stderr,
+                            flush=True,
+                        )
             else:
+                if pending_changes:
+                    continue
                 full_job = min(schedule, key=lambda item: item["next_run"])
                 now = time.monotonic()
                 if full_job["next_run"] > now:
@@ -891,6 +924,69 @@ def command_watch(
             record["stop_event"].set()
         for record in monitor_records.values():
             record["thread"].join(timeout=2)
+
+
+def _enqueue_pending_change(
+    pending_changes: Dict[Tuple[str, str], dict],
+    change: dict,
+) -> None:
+    key = (change["email"], change["folder"])
+    existing = pending_changes.get(key)
+    queued = dict(change)
+    if existing is not None:
+        for field in ("_queued_at", "_retry_at", "_retry_attempt"):
+            if field in existing:
+                queued[field] = existing[field]
+    queued.setdefault("_queued_at", time.monotonic())
+    queued.setdefault("_retry_at", 0.0)
+    queued.setdefault("_retry_attempt", 0)
+    pending_changes[key] = queued
+
+
+def _next_pending_change_time(
+    pending_changes: Dict[Tuple[str, str], dict],
+    now: float,
+) -> Optional[float]:
+    if not pending_changes:
+        return None
+    return max(
+        now,
+        min(float(change.get("_retry_at") or 0.0) for change in pending_changes.values()),
+    )
+
+
+def _pop_ready_pending_change(
+    pending_changes: Dict[Tuple[str, str], dict],
+    now: float,
+) -> Optional[dict]:
+    ready = [
+        (key, change)
+        for key, change in pending_changes.items()
+        if float(change.get("_retry_at") or 0.0) <= now
+    ]
+    if not ready:
+        return None
+    key, change = min(
+        ready,
+        key=lambda item: float(item[1].get("_queued_at") or 0.0),
+    )
+    pending_changes.pop(key, None)
+    return change
+
+
+def _schedule_incremental_retry(
+    pending_changes: Dict[Tuple[str, str], dict],
+    change: dict,
+) -> Optional[Tuple[int, float]]:
+    retry_attempt = int(change.get("_retry_attempt") or 0) + 1
+    if retry_attempt > len(INCREMENTAL_SYNC_RETRY_DELAYS):
+        return None
+    retry_delay = INCREMENTAL_SYNC_RETRY_DELAYS[retry_attempt - 1]
+    retry_change = dict(change)
+    retry_change["_retry_attempt"] = retry_attempt
+    retry_change["_retry_at"] = time.monotonic() + retry_delay
+    pending_changes[(change["email"], change["folder"])] = retry_change
+    return retry_attempt, retry_delay
 
 
 def _source_realtime_poll_interval(profile: dict, default: float) -> float:

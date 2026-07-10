@@ -45,8 +45,8 @@ class OAuthTests(unittest.TestCase):
                 45.0,
             ),
             mock.patch.object(
-                connection_module.imaplib,
-                "IMAP4_SSL",
+                connection_module,
+                "DirectIMAP4_SSL",
                 return_value=client,
             ) as imap_ssl,
         ):
@@ -63,8 +63,8 @@ class OAuthTests(unittest.TestCase):
             "imap_timeout": 12,
         }
         with mock.patch.object(
-            connection_module.imaplib,
-            "IMAP4_SSL",
+            connection_module,
+            "DirectIMAP4_SSL",
             return_value=client,
         ) as imap_ssl:
             result = mail_sync.connect(profile)
@@ -78,7 +78,11 @@ class OAuthTests(unittest.TestCase):
             "password": "secret",
             "imap_server": "imap.example.com",
         }
-        with mock.patch.object(connection_module.imaplib, "IMAP4_SSL", return_value=client):
+        with mock.patch.object(
+            connection_module,
+            "DirectIMAP4_SSL",
+            return_value=client,
+        ):
             result = mail_sync.connect(profile)
         self.assertIs(result, client)
         self.assertEqual(client.login_calls, [("legacy@example.com", "secret")])
@@ -97,7 +101,11 @@ class OAuthTests(unittest.TestCase):
             },
         }
         with (
-            mock.patch.object(connection_module.imaplib, "IMAP4_SSL", return_value=client),
+            mock.patch.object(
+                connection_module,
+                "DirectIMAP4_SSL",
+                return_value=client,
+            ),
             mock.patch.object(
                 oauth_module,
                 "microsoft_access_token",
@@ -132,7 +140,7 @@ class OAuthTests(unittest.TestCase):
                 "ProxiedIMAP4_SSL",
                 return_value=client,
             ) as proxied,
-            mock.patch.object(connection_module.imaplib, "IMAP4_SSL") as direct,
+            mock.patch.object(connection_module, "DirectIMAP4_SSL") as direct,
         ):
             result = mail_sync.connect(profile)
         self.assertIs(result, client)
@@ -143,6 +151,27 @@ class OAuthTests(unittest.TestCase):
         self.assertEqual(proxy.host, "192.168.1.178")
         self.assertEqual(proxy.port, 6152)
         self.assertEqual(client.login_calls, [("user@gmail.com", "secret")])
+
+    def test_direct_imap_connect_has_a_separate_total_timeout(self):
+        client = mock.Mock(host="imap.example.com", port=993)
+        sock = mock.Mock()
+        with (
+            mock.patch.object(
+                connection_module,
+                "DEFAULT_IMAP_CONNECT_TIMEOUT_SECONDS",
+                10.0,
+            ),
+            mock.patch.object(
+                connection_module,
+                "_race_direct_connection",
+                return_value=sock,
+            ) as race,
+        ):
+            result = connection_module._direct_imap_socket(client, 45.0)
+
+        self.assertIs(result, sock)
+        race.assert_called_once_with("imap.example.com", 993, 10.0)
+        sock.settimeout.assert_called_once_with(45.0)
 
     def test_expired_token_is_refreshed_and_rotated_atomically(self):
         with tempfile.TemporaryDirectory() as directory:
