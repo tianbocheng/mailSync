@@ -132,7 +132,7 @@ class OAuthTests(unittest.TestCase):
             "password": "secret",
             "imap_server": "imap.gmail.com",
             "imap_port": 993,
-            "imap_proxy": "http://192.168.1.178:6152",
+            "imap_proxy": "http://127.0.0.1:6152",
         }
         with (
             mock.patch.object(
@@ -148,7 +148,7 @@ class OAuthTests(unittest.TestCase):
         host, port, proxy = proxied.call_args.args
         self.assertEqual(host, "imap.gmail.com")
         self.assertEqual(port, 993)
-        self.assertEqual(proxy.host, "192.168.1.178")
+        self.assertEqual(proxy.host, "127.0.0.1")
         self.assertEqual(proxy.port, 6152)
         self.assertEqual(client.login_calls, [("user@gmail.com", "secret")])
 
@@ -432,7 +432,7 @@ class ConfigValidationTests(unittest.TestCase):
         config = self.valid_config()
         config["sources"][0]["imap_proxy"] = {
             "type": "http_connect",
-            "host": "192.168.1.178",
+            "host": "127.0.0.1",
             "port": 6152,
         }
         labels = mail_sync.label_id_map(config["synology_labels"])

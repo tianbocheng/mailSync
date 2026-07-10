@@ -3,6 +3,7 @@
 .env
 
 data/
+initial-admin-password.txt
 logs/
 backups/
 

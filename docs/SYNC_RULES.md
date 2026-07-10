@@ -5,7 +5,7 @@
 1. 自动列出来源邮箱的所有可选择文件夹，并排除草稿文件夹。
 2. 所有来源邮件统一写入目标邮箱的 `INBOX`。
 3. 每封目标邮件添加两个 Synology 标签：
-   - 来源账号：例如 `SYNC:790209876@qq.com`
+   - 来源账号：例如 `SYNC:source@example.com`
    - 来源文件夹：例如 `BOX:收件箱`、`BOX:已发邮件`
 4. 使用 SQLite 保存来源 UID、`Message-ID`、内容哈希和目标 UID，重复运行不会重复同步。
    首次接管已有目标邮箱时，如果发现相同 `Message-ID` 的未跟踪旧副本，会以来源原件重建并替换旧副本。
@@ -33,21 +33,23 @@ python3 backend/mail_sync.py import-config backend/config/config.json
 python3 backend/mail_sync.py serve --host 127.0.0.1 --port 24000
 ```
 
-首次初始化数据库时会创建 `admin` 管理员用户。默认用户名和密码可通过
-`MAIL_SYNC_ADMIN_USERNAME`、`MAIL_SYNC_ADMIN_PASSWORD` 覆盖；密码以
-PBKDF2 哈希形式保存在 `login_users` 表，不保存明文。
+首次初始化数据库时会创建 `admin` 管理员用户。用户名可通过
+`MAIL_SYNC_ADMIN_USERNAME` 覆盖。首次部署建议显式设置
+`MAIL_SYNC_ADMIN_PASSWORD`；如果未设置，程序会生成一次性随机初始密码并写入
+状态库同目录的 `initial-admin-password.txt`，该文件权限为 `0600`，登录并设置
+永久密码后应删除。密码以 PBKDF2 哈希形式保存在 `login_users` 表，不保存明文。
 
 列出来源文件夹：
 
 ```bash
-python3 backend/mail_sync.py list-folders --source 790209876@qq.com
+python3 backend/mail_sync.py list-folders --source source@example.com
 ```
 
 同步最新一封邮件用于测试：
 
 ```bash
 python3 backend/mail_sync.py sync \
-  --source 790209876@qq.com \
+  --source source@example.com \
   --folder INBOX \
   --limit 1 \
   --newest-first
@@ -62,7 +64,7 @@ python3 backend/mail_sync.py sync
 完整同步单个来源并执行该来源的删除对账：
 
 ```bash
-python3 backend/mail_sync.py sync --source 790209876@qq.com
+python3 backend/mail_sync.py sync --source source@example.com
 ```
 
 升级日期解析逻辑或迁移旧状态库后，执行源、状态库和目标日期校验：
@@ -174,10 +176,10 @@ SYNC_INTERVAL=900 python3 backend/mail_sync.py watch
 
 ```json
 {
-  "email": "tianbocheng11@gmail.com",
+  "email": "source-gmail@example.com",
   "imap_server": "imap.gmail.com",
   "imap_port": 993,
-  "imap_proxy": "http://192.168.1.178:6152",
+  "imap_proxy": "http://127.0.0.1:6152",
   "use_ssl": true
 }
 ```
@@ -188,7 +190,7 @@ SYNC_INTERVAL=900 python3 backend/mail_sync.py watch
 {
   "imap_proxy": {
     "type": "http_connect",
-    "host": "192.168.1.178",
+    "host": "127.0.0.1",
     "port": 6152
   }
 }

@@ -17,7 +17,7 @@ from config.proxy import parse_imap_proxy
 PASSWORD_ALGORITHM = "pbkdf2_sha256"
 PASSWORD_ITERATIONS = 260_000
 DEFAULT_ADMIN_USERNAME = "admin"
-DEFAULT_ADMIN_PASSWORD = "TEST_ADMIN_PASSWORD"
+DEFAULT_ADMIN_PASSWORD_FILE = "initial-admin-password.txt"
 
 ACCOUNT_KEYS = {
     "email",
@@ -182,7 +182,12 @@ def ensure_default_admin_user(db: sqlite3.Connection) -> None:
     ).fetchone()
     if existing is not None:
         return
-    password = os.environ.get("MAIL_SYNC_ADMIN_PASSWORD", DEFAULT_ADMIN_PASSWORD)
+    password = os.environ.get("MAIL_SYNC_ADMIN_PASSWORD", "")
+    must_change_password = 0
+    if not password:
+        password = secrets.token_urlsafe(24)
+        must_change_password = 1
+        _write_initial_admin_password(db, username, password)
     now = _now_iso()
     salt, password_hash = hash_password(password)
     db.execute(
@@ -192,7 +197,7 @@ def ensure_default_admin_user(db: sqlite3.Connection) -> None:
             password_iterations, role, enabled, must_change_password,
             created_at, updated_at
         )
-        VALUES(?, ?, ?, ?, ?, 'admin', 1, 0, ?, ?)
+        VALUES(?, ?, ?, ?, ?, 'admin', 1, ?, ?, ?)
         """,
         (
             username,
@@ -200,10 +205,44 @@ def ensure_default_admin_user(db: sqlite3.Connection) -> None:
             salt,
             PASSWORD_ALGORITHM,
             PASSWORD_ITERATIONS,
+            must_change_password,
             now,
             now,
         ),
     )
+
+
+def _write_initial_admin_password(
+    db: sqlite3.Connection,
+    username: str,
+    password: str,
+) -> None:
+    password_file = _initial_admin_password_path(db)
+    if password_file is None:
+        return
+    password_file.parent.mkdir(parents=True, exist_ok=True)
+    password_file.write_text(
+        "\n".join(
+            [
+                "Mail Sync generated this one-time initial admin password",
+                "because MAIL_SYNC_ADMIN_PASSWORD was not set.",
+                f"username: {username}",
+                f"password: {password}",
+                "Delete this file after setting a permanent admin password.",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    os.chmod(password_file, 0o600)
+
+
+def _initial_admin_password_path(db: sqlite3.Connection) -> Optional[Path]:
+    for _, name, filename in db.execute("PRAGMA database_list"):
+        if name != "main" or not filename or filename == ":memory:":
+            continue
+        return Path(str(filename)).with_name(DEFAULT_ADMIN_PASSWORD_FILE)
+    return None
 
 
 def has_runtime_config(db: sqlite3.Connection) -> bool:

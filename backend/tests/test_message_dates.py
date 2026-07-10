@@ -172,7 +172,7 @@ class MessageDateTests(unittest.TestCase):
         )
 
 class QQDateCompatibilityTests(unittest.TestCase):
-    def message(self, raw, source_email="790209876@qq.com"):
+    def message(self, raw, source_email="source@qq.com"):
         return mail_sync.SourceMessage(
             source_email=source_email,
             folder="INBOX",

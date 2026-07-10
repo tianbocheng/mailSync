@@ -1,6 +1,7 @@
 import base64
 import io
 import json
+import os
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -342,14 +343,18 @@ class WebConsoleTests(unittest.TestCase):
                 "window.__MAIL_SYNC_APP__ = true;",
                 encoding="utf-8",
             )
-            db = mail_sync.init_db(state_path)
+            with mock.patch.dict(
+                os.environ,
+                {"MAIL_SYNC_ADMIN_PASSWORD": "test-admin-password"},
+            ):
+                db = mail_sync.init_db(state_path)
             try:
                 import_legacy_config(db, self.valid_config())
                 self.assertIsNone(authenticate_user(db, "admin", "wrong"))
                 user = authenticate_user(
                     db,
                     "admin",
-                    "TEST_ADMIN_PASSWORD",
+                    "test-admin-password",
                 )
                 self.assertIsNotNone(user)
 
@@ -425,7 +430,7 @@ class WebConsoleTests(unittest.TestCase):
                 headers=ajax_headers,
                 form={
                     "username": "admin",
-                    "password": "TEST_ADMIN_PASSWORD",
+                    "password": "test-admin-password",
                 },
             )
             self.assertEqual(status, 200)
@@ -434,7 +439,7 @@ class WebConsoleTests(unittest.TestCase):
             self.assertEqual(login_data["username"], "admin")
             self.assertEqual(login_data["redirect_url"], "/#/rules")
             self.assertIn("mailsync_session=", headers["Set-Cookie"])
-            self.assertNotIn("MailSync2026", headers["Set-Cookie"])
+            self.assertNotIn("test-admin-password", headers["Set-Cookie"])
 
             status, headers, _ = request("/logout", cookie_header=headers["Set-Cookie"])
             self.assertEqual(status, 303)

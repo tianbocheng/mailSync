@@ -14,6 +14,7 @@ from sync import engine as engine_module
 from sync import reconcile as reconcile_module
 from sync import recovery as recovery_module
 from storage.config_db import (
+    DEFAULT_ADMIN_PASSWORD_FILE,
     DEFAULT_ADMIN_USERNAME,
     PASSWORD_ALGORITHM,
     verify_password,
@@ -31,12 +32,19 @@ class LoginUserSchemaTests(unittest.TestCase):
                     """
                     SELECT username, password_hash, password_salt,
                            password_algorithm, password_iterations, role,
-                           enabled
+                           enabled, must_change_password
                     FROM login_users
                     WHERE username=?
                     """,
                     (DEFAULT_ADMIN_USERNAME,),
                 ).fetchone()
+                password_file = Path(directory) / DEFAULT_ADMIN_PASSWORD_FILE
+                password_line = next(
+                    line
+                    for line in password_file.read_text(encoding="utf-8").splitlines()
+                    if line.startswith("password: ")
+                )
+                initial_password = password_line.removeprefix("password: ")
             finally:
                 db.close()
 
@@ -44,10 +52,11 @@ class LoginUserSchemaTests(unittest.TestCase):
         self.assertEqual(row["password_algorithm"], PASSWORD_ALGORITHM)
         self.assertEqual(row["role"], "admin")
         self.assertEqual(row["enabled"], 1)
-        self.assertNotEqual(row["password_hash"], "TEST_ADMIN_PASSWORD")
+        self.assertEqual(row["must_change_password"], 1)
+        self.assertGreaterEqual(len(initial_password), 32)
         self.assertTrue(
             verify_password(
-                "TEST_ADMIN_PASSWORD",
+                initial_password,
                 row["password_salt"],
                 row["password_hash"],
                 row["password_iterations"],
