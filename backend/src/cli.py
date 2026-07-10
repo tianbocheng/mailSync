@@ -288,6 +288,7 @@ def command_sync(
                     ):
                         folder_status = None
                     uids = search_uids(source)
+                    all_folder_uids = list(uids)
                     if (
                         watermark_allowed
                         and folder_status is not None
@@ -297,7 +298,7 @@ def command_sync(
                             email,
                             folder.raw_name,
                             folder_status,
-                            uids,
+                            all_folder_uids,
                             scan_signature,
                             target_email,
                             target_service_address,
@@ -574,7 +575,7 @@ def command_sync(
                             scan_signature,
                             target_email,
                             target_service_address,
-                            source_uids=uids,
+                            source_uids=all_folder_uids,
                         )
                     db.commit()
                     if not source_scan_complete:
