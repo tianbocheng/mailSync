@@ -139,6 +139,116 @@ class ScheduleRefreshTests(unittest.TestCase):
         self.assertEqual(refreshed[0]["batch_size"], 200)
         self.assertEqual(refreshed[0]["next_run"], 1000.0)
 
+    def test_refresh_preserves_monitor_skip_state(self):
+        existing = [
+            {
+                "email": "source@example.com",
+                "interval": 120,
+                "batch_size": 20,
+                "last_run": 100.0,
+                "last_forced_run": 90.0,
+                "last_monitor_version": 7,
+                "next_run": 220.0,
+            }
+        ]
+
+        refreshed = mail_sync.refresh_source_schedule(
+            [{"email": "source@example.com", "sync_interval": 120}],
+            900,
+            existing,
+        )
+
+        self.assertEqual(refreshed[0]["last_forced_run"], 90.0)
+        self.assertEqual(refreshed[0]["last_monitor_version"], 7)
+
+    def test_monitor_unchanged_full_scan_skip_requires_all_folder_monitor(self):
+        rule = {
+            "email": "source@example.com",
+            "service_address": "imap.example.com",
+        }
+        profiles = {
+            "source@example.com": {"service_address": "imap.example.com"}
+        }
+        job = {
+            "email": "source@example.com",
+            "last_forced_run": 100.0,
+            "last_monitor_version": 2,
+        }
+        records = {
+            ("source@example.com", "imap.example.com"): {
+                "state": {
+                    "ready": True,
+                    "coverage": "all_folders",
+                    "change_version": 2,
+                }
+            }
+        }
+
+        with mock.patch.object(
+            mail_sync,
+            "MONITOR_UNCHANGED_FULL_SCAN_SKIP_SECONDS",
+            600,
+        ):
+            self.assertTrue(
+                mail_sync._scheduled_full_scan_can_skip(
+                    job,
+                    rule,
+                    profiles,
+                    records,
+                    200.0,
+                )
+            )
+            records[("source@example.com", "imap.example.com")]["state"][
+                "coverage"
+            ] = "inbox"
+            self.assertFalse(
+                mail_sync._scheduled_full_scan_can_skip(
+                    job,
+                    rule,
+                    profiles,
+                    records,
+                    200.0,
+                )
+            )
+
+    def test_monitor_unchanged_full_scan_skip_expires_for_safety(self):
+        rule = {
+            "email": "source@example.com",
+            "service_address": "imap.example.com",
+        }
+        profiles = {
+            "source@example.com": {"service_address": "imap.example.com"}
+        }
+        job = {
+            "email": "source@example.com",
+            "last_forced_run": 100.0,
+            "last_monitor_version": 2,
+        }
+        records = {
+            ("source@example.com", "imap.example.com"): {
+                "state": {
+                    "ready": True,
+                    "coverage": "all_folders",
+                    "change_version": 2,
+                }
+            }
+        }
+
+        with mock.patch.object(
+            mail_sync,
+            "MONITOR_UNCHANGED_FULL_SCAN_SKIP_SECONDS",
+            600,
+        ):
+            self.assertFalse(
+                mail_sync._scheduled_full_scan_can_skip(
+                    job,
+                    rule,
+                    profiles,
+                    records,
+                    800.0,
+                )
+            )
+
 
 class RealtimeMonitorRefreshTests(unittest.TestCase):
     def test_sync_source_monitors_starts_rule_added_after_watch_start(self):
@@ -187,6 +297,7 @@ class RealtimeMonitorRefreshTests(unittest.TestCase):
             )
             self.assertIn(("source@example.com", "imap.example.com"), records)
             self.assertTrue(created_threads[0].started)
+            self.assertIn("change_version", created_threads[0].args[-1])
             self.assertFalse(
                 records[("source@example.com", "imap.example.com")][
                     "stop_event"

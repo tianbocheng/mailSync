@@ -130,6 +130,9 @@ from sync.settings import DEFAULT_SYNC_INTERVAL_SECONDS
 
 
 RUN_CHILD_STOP_TIMEOUT_SECONDS = 8.0
+MONITOR_UNCHANGED_FULL_SCAN_SKIP_SECONDS = int(
+    os.environ.get("MONITOR_UNCHANGED_FULL_SCAN_SKIP_SECONDS", "600")
+)
 
 
 def _folder_scan_signature(
@@ -737,6 +740,13 @@ def command_watch(
                         sync_source=_change_sync_source(change),
                     )
                     success = True
+                    _mark_schedule_monitor_synced(
+                        schedule,
+                        change["email"],
+                        rules,
+                        active_profiles,
+                        monitor_records,
+                    )
                     _record_watch_success(state_path, change["email"])
                 except (
                     SyncError,
@@ -763,9 +773,51 @@ def command_watch(
                     )
             else:
                 full_job = min(schedule, key=lambda item: item["next_run"])
-                if full_job["next_run"] > time.monotonic():
+                now = time.monotonic()
+                if full_job["next_run"] > now:
                     continue
                 cycle += 1
+                full_rule = _watch_rule_for_job(rules, full_job)
+                if (
+                    full_rule is not None
+                    and _scheduled_full_scan_can_skip(
+                        full_job,
+                        full_rule,
+                        active_profiles,
+                        monitor_records,
+                        now,
+                    )
+                ):
+                    monitor_version = _monitor_record_version(
+                        _monitor_record_for_rule(
+                            monitor_records,
+                            full_rule,
+                            active_profiles,
+                        )
+                    )
+                    print(
+                        json.dumps(
+                            {
+                                "event": "source_full_scan_skipped_monitor_unchanged",
+                                "cycle": cycle,
+                                "source": full_job["email"],
+                                "interval": full_job["interval"],
+                                "monitor_version": monitor_version,
+                                "time": now_iso(),
+                            },
+                            ensure_ascii=False,
+                        ),
+                        flush=True,
+                    )
+                    ran_at = time.monotonic()
+                    full_job["last_run"] = ran_at
+                    full_job["last_monitor_version"] = monitor_version
+                    full_job["next_run"] = ran_at + full_job["interval"]
+                    success = True
+                    if max_cycles is not None and cycle >= max_cycles:
+                        return 0
+                    _log_next_source_sync(schedule)
+                    continue
                 print(
                     json.dumps(
                         {
@@ -797,6 +849,12 @@ def command_watch(
                         sync_source=_rule_full_scan_source(full_job),
                     )
                     success = True
+                    _mark_job_forced_run(
+                        full_job,
+                        full_rule,
+                        active_profiles,
+                        monitor_records,
+                    )
                     _record_watch_success(state_path, full_job["email"])
                 except (
                     SyncError,
@@ -827,24 +885,7 @@ def command_watch(
             if max_cycles is not None and cycle >= max_cycles:
                 return 0 if success else 1
 
-            next_job = min(schedule, key=lambda item: item["next_run"])
-            print(
-                json.dumps(
-                    {
-                        "event": "next_source_sync_scheduled",
-                        "source": next_job["email"],
-                        "seconds": round(
-                            max(
-                                0.0,
-                                next_job["next_run"] - time.monotonic(),
-                            ),
-                            3,
-                        ),
-                    },
-                    ensure_ascii=False,
-                ),
-                flush=True,
-            )
+            _log_next_source_sync(schedule)
     finally:
         for record in monitor_records.values():
             record["stop_event"].set()
@@ -935,6 +976,12 @@ def _sync_source_monitors(
         if key in monitor_records:
             continue
         stop_event = threading.Event()
+        monitor_state = {
+            "ready": False,
+            "coverage": "",
+            "change_version": 0,
+            "snapshots": {},
+        }
         monitor = threading.Thread(
             target=monitor_realtime_changes,
             args=(
@@ -944,6 +991,7 @@ def _sync_source_monitors(
                 source_poll_interval,
                 changes,
                 stop_event,
+                monitor_state,
             ),
             name=f"mail-monitor-{rule['email']}",
             daemon=True,
@@ -953,6 +1001,7 @@ def _sync_source_monitors(
             "thread": monitor,
             "stop_event": stop_event,
             "signature": signature,
+            "state": monitor_state,
         }
 
 
@@ -968,6 +1017,112 @@ def _rule_full_scan_source(rule: dict) -> str:
     if str(rule.get("sync_mode") or "realtime") == "scheduled":
         return "imap_scheduled"
     return "imap_scan"
+
+
+def _log_next_source_sync(schedule: Sequence[dict]) -> None:
+    next_job = min(schedule, key=lambda item: item["next_run"])
+    print(
+        json.dumps(
+            {
+                "event": "next_source_sync_scheduled",
+                "source": next_job["email"],
+                "seconds": round(
+                    max(0.0, next_job["next_run"] - time.monotonic()),
+                    3,
+                ),
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
+
+
+def _watch_rule_for_job(rules: Sequence[dict], job: dict) -> Optional[dict]:
+    job_email = str(job.get("email") or "")
+    for rule in rules:
+        if str(rule.get("email") or "") == job_email:
+            return rule
+    return None
+
+
+def _monitor_record_for_rule(
+    monitor_records: Dict[Tuple[str, str], dict],
+    rule: dict,
+    profiles: Dict[str, dict],
+) -> Optional[dict]:
+    profile = profiles.get(rule["email"])
+    if profile is None:
+        return None
+    return monitor_records.get(_source_monitor_key(rule, profile))
+
+
+def _monitor_record_version(record: Optional[dict]) -> Optional[int]:
+    if record is None:
+        return None
+    state = record.get("state") or {}
+    try:
+        return int(state.get("change_version", 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _scheduled_full_scan_can_skip(
+    job: dict,
+    rule: dict,
+    profiles: Dict[str, dict],
+    monitor_records: Dict[Tuple[str, str], dict],
+    now: float,
+) -> bool:
+    if str(rule.get("sync_mode") or "realtime") == "scheduled":
+        return False
+    record = _monitor_record_for_rule(monitor_records, rule, profiles)
+    if record is None:
+        return False
+    state = record.get("state") or {}
+    if not state.get("ready") or state.get("coverage") != "all_folders":
+        return False
+    last_monitor_version = job.get("last_monitor_version")
+    if last_monitor_version is None:
+        return False
+    monitor_version = _monitor_record_version(record)
+    if monitor_version != last_monitor_version:
+        return False
+    last_forced_run = float(job.get("last_forced_run") or 0.0)
+    return now - last_forced_run < MONITOR_UNCHANGED_FULL_SCAN_SKIP_SECONDS
+
+
+def _mark_job_forced_run(
+    job: dict,
+    rule: Optional[dict],
+    profiles: Dict[str, dict],
+    monitor_records: Dict[Tuple[str, str], dict],
+) -> None:
+    job["last_forced_run"] = time.monotonic()
+    if rule is None:
+        return
+    monitor_version = _monitor_record_version(
+        _monitor_record_for_rule(monitor_records, rule, profiles)
+    )
+    if monitor_version is not None:
+        job["last_monitor_version"] = monitor_version
+
+
+def _mark_schedule_monitor_synced(
+    schedule: Sequence[dict],
+    email: str,
+    rules: Sequence[dict],
+    profiles: Dict[str, dict],
+    monitor_records: Dict[Tuple[str, str], dict],
+) -> None:
+    job = next((item for item in schedule if item.get("email") == email), None)
+    rule = _watch_rule_for_job(rules, {"email": email})
+    if job is None or rule is None:
+        return
+    monitor_version = _monitor_record_version(
+        _monitor_record_for_rule(monitor_records, rule, profiles)
+    )
+    if monitor_version is not None:
+        job["last_monitor_version"] = monitor_version
 
 
 def _watch_runtime_context(

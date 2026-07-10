@@ -143,6 +143,7 @@ def monitor_inbox_idle_changes(
     idle_error_fallback_threshold: int = DEFAULT_IDLE_ERROR_FALLBACK_THRESHOLD,
     compensation_interval: Optional[float] = None,
     missed_push_fallback_threshold: int = DEFAULT_IDLE_MISSED_PUSH_FALLBACK_THRESHOLD,
+    monitor_state: Optional[dict] = None,
 ) -> None:
     if not _only_inbox_requested(only_folder):
         raise IdleUnsupported(
@@ -180,6 +181,10 @@ def monitor_inbox_idle_changes(
                 readonly=True,
             )
             previous = mailbox_status(client, folder.raw_name)
+            if monitor_state is not None:
+                monitor_state["coverage"] = "inbox"
+                monitor_state["ready"] = True
+                monitor_state["snapshots"] = {folder.raw_name: previous}
             print(
                 json.dumps(
                     {
@@ -223,6 +228,11 @@ def monitor_inbox_idle_changes(
                     missed_pushes = 0
                 if current == previous:
                     continue
+                if monitor_state is not None:
+                    monitor_state["change_version"] = (
+                        int(monitor_state.get("change_version", 0)) + 1
+                    )
+                    monitor_state["snapshots"] = {folder.raw_name: current}
                 if not changed:
                     missed_pushes += 1
                     print(
@@ -304,6 +314,7 @@ def monitor_realtime_changes(
     poll_interval: float,
     changes: "queue.Queue[dict]",
     stop_event: threading.Event,
+    monitor_state: Optional[dict] = None,
 ) -> None:
     if _saved_idle_supported(profile) is False:
         if not stop_event.is_set():
@@ -328,6 +339,7 @@ def monitor_realtime_changes(
             poll_interval,
             changes,
             stop_event,
+            monitor_state=monitor_state,
         )
         return
     try:
@@ -338,6 +350,7 @@ def monitor_realtime_changes(
             changes,
             stop_event,
             compensation_interval=poll_interval,
+            monitor_state=monitor_state,
         )
     except IdleUnsupported as exc:
         if not stop_event.is_set():
@@ -362,6 +375,7 @@ def monitor_realtime_changes(
             poll_interval,
             changes,
             stop_event,
+            monitor_state=monitor_state,
         )
 
 
@@ -384,6 +398,7 @@ def monitor_source_changes(
     poll_interval: float,
     changes: "queue.Queue[dict]",
     stop_event: threading.Event,
+    monitor_state: Optional[dict] = None,
 ) -> None:
     email = source_rule["email"]
     reconnect_delay = max(2.0, poll_interval)
@@ -405,6 +420,10 @@ def monitor_source_changes(
                 folder.raw_name: mailbox_status(client, folder.raw_name)
                 for folder in folders
             }
+            if monitor_state is not None:
+                monitor_state["coverage"] = "all_folders"
+                monitor_state["ready"] = True
+                monitor_state["snapshots"] = dict(snapshots)
             print(
                 json.dumps(
                     {
@@ -425,6 +444,11 @@ def monitor_source_changes(
                     if current == previous:
                         continue
                     snapshots[folder.raw_name] = current
+                    if monitor_state is not None:
+                        monitor_state["change_version"] = (
+                            int(monitor_state.get("change_version", 0)) + 1
+                        )
+                        monitor_state["snapshots"] = dict(snapshots)
                     changes.put(
                         {
                             "email": email,

@@ -25,9 +25,12 @@ def build_source_schedule(
         schedule.append(
             {
                 "email": rule["email"],
+                "sync_mode": str(rule.get("sync_mode") or "realtime"),
                 "interval": source_interval,
                 "batch_size": batch_size,
                 "last_run": next_run - source_interval,
+                "last_forced_run": 0.0,
+                "last_monitor_version": None,
                 "next_run": next_run,
             }
         )
@@ -72,9 +75,20 @@ def refresh_source_schedule(
         refreshed.append(
             {
                 "email": rule["email"],
+                "sync_mode": str(rule.get("sync_mode") or "realtime"),
                 "interval": source_interval,
                 "batch_size": batch_size,
                 "last_run": last_run,
+                "last_forced_run": _existing_float(
+                    existing,
+                    "last_forced_run",
+                    0.0,
+                ),
+                "last_monitor_version": (
+                    existing.get("last_monitor_version")
+                    if existing is not None
+                    else None
+                ),
                 "next_run": next_run,
             }
         )
@@ -89,6 +103,19 @@ def _initial_source_offset(
 ) -> float:
     slot_window = min(float(interval), float(source_interval))
     return index * (slot_window / source_count)
+
+
+def _existing_float(
+    existing: dict | None,
+    key: str,
+    default: float,
+) -> float:
+    if existing is None:
+        return default
+    try:
+        return float(existing.get(key) or default)
+    except (TypeError, ValueError):
+        return default
 
 
 def _source_schedule_values(rule: dict, interval: int) -> tuple[int, int]:
