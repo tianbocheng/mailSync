@@ -415,6 +415,44 @@ class RealtimeIncrementalTests(unittest.TestCase):
         self.assertEqual(change["folder"], "INBOX")
         self.assertEqual(change["current"], (1, 11, 10))
 
+    def test_source_monitor_checks_inbox_first(self):
+        changes = mail_sync.queue.Queue()
+        stop_event = self.OnePollStopEvent()
+        client = mock.Mock()
+        folders = [
+            mail_sync.FolderInfo("Sent Items", "Sent Items", ()),
+            mail_sync.FolderInfo("Trash", "Trash", ()),
+            mail_sync.FolderInfo("INBOX", "INBOX", ()),
+        ]
+        checked = []
+
+        def mailbox_status_side_effect(_client, folder):
+            checked.append(folder)
+            return (1, 10, 9)
+
+        with (
+            mock.patch.object(listener_module, "connect", return_value=client),
+            mock.patch.object(listener_module, "list_folders", return_value=folders),
+            mock.patch.object(
+                listener_module,
+                "mailbox_status",
+                side_effect=mailbox_status_side_effect,
+            ),
+            mock.patch.object(listener_module, "safe_logout"),
+            mock.patch("builtins.print"),
+        ):
+            mail_sync.monitor_source_changes(
+                {"email": "source@example.com"},
+                {"email": "source@example.com"},
+                None,
+                1,
+                changes,
+                stop_event,
+            )
+
+        self.assertEqual(checked[:3], ["INBOX", "Sent Items", "Trash"])
+        self.assertEqual(checked[3:6], ["INBOX", "Sent Items", "Trash"])
+
     def test_inbox_idle_monitor_queues_changed_inbox(self):
         changes = mail_sync.queue.Queue()
         stop_event = self.ManualStopEvent()

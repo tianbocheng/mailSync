@@ -133,6 +133,18 @@ def _only_inbox_requested(only_folder: Optional[str]) -> bool:
     return only_folder is None or only_folder.casefold() == "inbox"
 
 
+def _prioritize_inbox(folders: list) -> list:
+    return sorted(
+        folders,
+        key=lambda folder: (
+            0
+            if folder.raw_name.casefold() == "inbox"
+            or folder.display_name.casefold() == "inbox"
+            else 1
+        ),
+    )
+
+
 def monitor_inbox_idle_changes(
     profile: dict,
     source_rule: dict,
@@ -406,9 +418,11 @@ def monitor_source_changes(
         client: Optional[imaplib.IMAP4] = None
         try:
             client = connect(profile)
-            folders = selectable_source_folders(
-                list_folders(client),
-                source_rule,
+            folders = _prioritize_inbox(
+                selectable_source_folders(
+                    list_folders(client),
+                    source_rule,
+                )
             )
             if only_folder:
                 folders = [
