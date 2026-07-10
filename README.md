@@ -22,6 +22,32 @@ Mail Sync is a mail synchronization tool for individuals and small teams. It syn
 - Support HTTP CONNECT proxy settings
 - Manage mailboxes, rules, labels, and connection tests from a built-in web console
 
+## 界面截图 / Screenshots
+
+以下截图使用脱敏数据展示主要管理页面。
+
+The screenshots below use redacted data and show the main admin views.
+
+### 同步规则 / Sync Rules
+
+![Sync rules](docs/screenshots/rules.png)
+
+### 规则详情 / Rule Details
+
+![Rule details](docs/screenshots/rule-detail.png)
+
+### 邮箱管理 / Mailboxes
+
+![Mailboxes](docs/screenshots/mailboxes.png)
+
+### 系统配置 / System Configuration
+
+![System configuration](docs/screenshots/config.png)
+
+### 同步日志 / Sync Logs
+
+![Sync logs](docs/screenshots/sync-logs.png)
+
 ## 目录 / Project Layout
 
 ```text
