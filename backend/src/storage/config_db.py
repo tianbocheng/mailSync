@@ -176,6 +176,12 @@ def verify_password(password: str, salt_hex: str, hash_hex: str, iterations: int
 
 def ensure_default_admin_user(db: sqlite3.Connection) -> None:
     username = os.environ.get("MAIL_SYNC_ADMIN_USERNAME", DEFAULT_ADMIN_USERNAME)
+    existing = db.execute(
+        "SELECT 1 FROM login_users WHERE username=? LIMIT 1",
+        (username,),
+    ).fetchone()
+    if existing is not None:
+        return
     password = os.environ.get("MAIL_SYNC_ADMIN_PASSWORD", DEFAULT_ADMIN_PASSWORD)
     now = _now_iso()
     salt, password_hash = hash_password(password)

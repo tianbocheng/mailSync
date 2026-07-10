@@ -54,6 +54,18 @@ class LoginUserSchemaTests(unittest.TestCase):
             )
         )
 
+    def test_init_db_does_not_rehash_existing_default_admin(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.sqlite3"
+            db = mail_sync.init_db(state_path)
+            db.close()
+
+            with mock.patch("storage.config_db.hash_password") as hash_password:
+                db = mail_sync.init_db(state_path)
+                db.close()
+
+        hash_password.assert_not_called()
+
 
 class QuarantineTests(unittest.TestCase):
     def _insert_pending_operation(
