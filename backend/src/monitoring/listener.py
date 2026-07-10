@@ -27,7 +27,13 @@ ACTIVE_SOURCE_LEASE_KEY = "active_source_lease"
 
 
 class IdleUnsupported(SyncError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        client: Optional[imaplib.IMAP4] = None,
+    ):
+        super().__init__(message)
+        self.client = client
 
 
 def source_client_lease(change: dict) -> Optional[SourceClientLease]:
@@ -297,14 +303,24 @@ def monitor_inbox_idle_changes(
         try:
             client = connect(profile)
             if not idle_supported(client):
-                raise IdleUnsupported(f"IMAP IDLE is not supported by {email}")
+                fallback_client = client
+                client = None
+                raise IdleUnsupported(
+                    f"IMAP IDLE is not supported by {email}",
+                    fallback_client,
+                )
             folders = selectable_source_folders(
                 list_folders(client),
                 source_rule,
             )
             folder = _inbox_folder(folders)
             if folder is None:
-                raise IdleUnsupported(f"INBOX is not selectable for {email}")
+                fallback_client = client
+                client = None
+                raise IdleUnsupported(
+                    f"INBOX is not selectable for {email}",
+                    fallback_client,
+                )
 
             _, selected_uidvalidity = select_mailbox(
                 client,
@@ -417,8 +433,11 @@ def monitor_inbox_idle_changes(
                 if client is None:
                     break
                 if missed_pushes >= missed_push_threshold:
+                    fallback_client = client
+                    client = None
                     raise IdleUnsupported(
-                        "IMAP IDLE missed repeated INBOX changes; falling back to polling"
+                        "IMAP IDLE missed repeated INBOX changes; falling back to polling",
+                        fallback_client,
                     )
                 _, selected_uidvalidity = select_mailbox(
                     client,
@@ -510,6 +529,11 @@ def monitor_realtime_changes(
             monitor_state=monitor_state,
         )
     except IdleUnsupported as exc:
+        fallback_client = exc.client
+        if stop_event.is_set():
+            if fallback_client is not None:
+                safe_logout(fallback_client)
+            return
         if not stop_event.is_set():
             print(
                 json.dumps(
@@ -533,6 +557,7 @@ def monitor_realtime_changes(
             changes,
             stop_event,
             monitor_state=monitor_state,
+            initial_client=fallback_client,
         )
 
 
@@ -556,13 +581,16 @@ def monitor_source_changes(
     changes: "queue.Queue[dict]",
     stop_event: threading.Event,
     monitor_state: Optional[dict] = None,
+    initial_client: Optional[imaplib.IMAP4] = None,
 ) -> None:
     email = source_rule["email"]
     reconnect_delay = max(2.0, poll_interval)
     while not stop_event.is_set():
-        client: Optional[imaplib.IMAP4] = None
+        client = initial_client
+        initial_client = None
         try:
-            client = connect(profile)
+            if client is None:
+                client = connect(profile)
             folders = _prioritize_inbox(
                 selectable_source_folders(
                     list_folders(client),
@@ -675,3 +703,5 @@ def monitor_source_changes(
             if client is not None:
                 safe_logout(client)
         stop_event.wait(reconnect_delay)
+    if initial_client is not None:
+        safe_logout(initial_client)

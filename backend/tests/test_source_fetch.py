@@ -623,11 +623,12 @@ class RealtimeIncrementalTests(unittest.TestCase):
     def test_realtime_monitor_falls_back_when_idle_is_unavailable(self):
         changes = mail_sync.queue.Queue()
         stop_event = self.ManualStopEvent()
+        client = mock.Mock()
         with (
             mock.patch.object(
                 listener_module,
                 "monitor_inbox_idle_changes",
-                side_effect=listener_module.IdleUnsupported("no idle"),
+                side_effect=listener_module.IdleUnsupported("no idle", client),
             ) as idle_monitor,
             mock.patch.object(listener_module, "monitor_source_changes") as status_monitor,
             mock.patch("builtins.print"),
@@ -643,6 +644,7 @@ class RealtimeIncrementalTests(unittest.TestCase):
 
         idle_monitor.assert_called_once()
         status_monitor.assert_called_once()
+        self.assertIs(status_monitor.call_args.kwargs["initial_client"], client)
 
     def test_idle_monitor_degrades_after_repeated_runtime_errors(self):
         changes = mail_sync.queue.Queue()
@@ -703,10 +705,10 @@ class RealtimeIncrementalTests(unittest.TestCase):
                 "idle_wait_for_change",
                 return_value=False,
             ),
-            mock.patch.object(listener_module, "safe_logout"),
+            mock.patch.object(listener_module, "safe_logout") as safe_logout,
             mock.patch("builtins.print"),
         ):
-            with self.assertRaises(listener_module.IdleUnsupported):
+            with self.assertRaises(listener_module.IdleUnsupported) as raised:
                 listener_module.monitor_inbox_idle_changes(
                     {"email": "source@example.com"},
                     {"email": "source@example.com"},
@@ -719,6 +721,8 @@ class RealtimeIncrementalTests(unittest.TestCase):
 
         self.assertEqual(changes.qsize(), 3)
         self.assertEqual(connect.call_count, 1)
+        self.assertIs(raised.exception.client, client)
+        safe_logout.assert_not_called()
         connection_ids = {
             listener_module.source_client_lease(change).connection_id
             for change in list(changes.queue)
