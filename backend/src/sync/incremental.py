@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 from typing import List, Sequence, Set, Tuple
 
@@ -8,6 +9,11 @@ from sync.target_identity import target_identity_filter, target_identity_params
 
 
 MailboxStatus = Tuple[int, int, int]
+
+
+def uid_list_signature(source_uids: Sequence[int]) -> str:
+    payload = ",".join(str(uid) for uid in sorted(int(uid) for uid in source_uids))
+    return hashlib.sha256(payload.encode("ascii")).hexdigest()
 
 
 def incremental_candidate_uids(
@@ -120,7 +126,7 @@ def folder_scan_state_unchanged(
     row = db.execute(
         """
         SELECT source_uidvalidity, source_uidnext, source_messages,
-               scan_signature
+               uid_list_signature, scan_signature
         FROM source_folder_scan_state
         WHERE source_email=? AND source_folder=?
           AND target_email=? AND target_service_address=?
@@ -142,6 +148,49 @@ def folder_scan_state_unchanged(
     )
 
 
+def folder_uid_list_state_unchanged(
+    db: sqlite3.Connection,
+    source_email: str,
+    source_folder: str,
+    status: MailboxStatus,
+    source_uids: Sequence[int],
+    scan_signature: str = "",
+    target_email: str = "",
+    target_service_address: str = "",
+) -> bool:
+    uidvalidity, uidnext, messages = status
+    if uidnext > 0:
+        return False
+    target_email_key, target_service_key = target_identity_params(
+        target_email,
+        target_service_address,
+    )
+    row = db.execute(
+        """
+        SELECT source_uidvalidity, source_messages,
+               uid_list_signature, scan_signature
+        FROM source_folder_scan_state
+        WHERE source_email=? AND source_folder=?
+          AND target_email=? AND target_service_address=?
+        """,
+        (
+            source_email,
+            source_folder,
+            target_email_key,
+            target_service_key,
+        ),
+    ).fetchone()
+    if row is None:
+        return False
+    return (
+        int(row["source_uidvalidity"]) == int(uidvalidity)
+        and int(row["source_messages"]) == int(messages)
+        and str(row["scan_signature"] or "") == str(scan_signature or "")
+        and str(row["uid_list_signature"] or "")
+        == uid_list_signature(source_uids)
+    )
+
+
 def upsert_folder_scan_state(
     db: sqlite3.Connection,
     source_email: str,
@@ -151,9 +200,15 @@ def upsert_folder_scan_state(
     scan_signature: str = "",
     target_email: str = "",
     target_service_address: str = "",
+    source_uids: Sequence[int] | None = None,
 ) -> None:
     uidvalidity, uidnext, messages = status
+    uid_signature = ""
     if uidnext <= 0:
+        if source_uids is None:
+            return
+        uid_signature = uid_list_signature(source_uids)
+    if uidnext <= 0 and int(messages) != len(source_uids or ()):
         return
     target_email_key, target_service_key = target_identity_params(
         target_email,
@@ -164,14 +219,15 @@ def upsert_folder_scan_state(
         INSERT INTO source_folder_scan_state (
             source_email, source_folder, target_email, target_service_address,
             source_uidvalidity, source_uidnext, source_messages,
-            scan_signature, last_complete_run, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            uid_list_signature, scan_signature, last_complete_run, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (
             source_email, source_folder, target_email, target_service_address
         ) DO UPDATE SET
             source_uidvalidity=excluded.source_uidvalidity,
             source_uidnext=excluded.source_uidnext,
             source_messages=excluded.source_messages,
+            uid_list_signature=excluded.uid_list_signature,
             scan_signature=excluded.scan_signature,
             last_complete_run=excluded.last_complete_run,
             updated_at=excluded.updated_at
@@ -184,6 +240,7 @@ def upsert_folder_scan_state(
             uidvalidity,
             uidnext,
             messages,
+            uid_signature,
             str(scan_signature or ""),
             run_id,
             now_iso(),

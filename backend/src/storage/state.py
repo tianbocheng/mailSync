@@ -11,7 +11,7 @@ from domain.message import message_subject
 from storage.config_db import ensure_config_tables
 
 
-DB_SCHEMA_VERSION = 10
+DB_SCHEMA_VERSION = 11
 DB_BUSY_TIMEOUT_SECONDS = 30
 
 
@@ -123,6 +123,7 @@ def init_db(path: Path) -> sqlite3.Connection:
             source_uidvalidity INTEGER NOT NULL,
             source_uidnext INTEGER NOT NULL,
             source_messages INTEGER NOT NULL,
+            uid_list_signature TEXT NOT NULL DEFAULT '',
             scan_signature TEXT NOT NULL DEFAULT '',
             last_complete_run TEXT NOT NULL,
             updated_at TEXT NOT NULL,
@@ -190,6 +191,17 @@ def init_db(path: Path) -> sqlite3.Connection:
             "PRAGMA table_info(pending_operations)"
         ).fetchall()
     }
+    folder_scan_state_columns = {
+        row[1]
+        for row in connection.execute(
+            "PRAGMA table_info(source_folder_scan_state)"
+        ).fetchall()
+    }
+    if "uid_list_signature" not in folder_scan_state_columns:
+        connection.execute(
+            "ALTER TABLE source_folder_scan_state "
+            "ADD COLUMN uid_list_signature TEXT NOT NULL DEFAULT ''"
+        )
     if "status" not in pending_columns:
         connection.execute(
             "ALTER TABLE pending_operations "

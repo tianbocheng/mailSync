@@ -90,6 +90,7 @@ from storage.rule_status import mark_sync_rule_failure, mark_sync_rule_success
 from sync.engine import purge_single_location_message, sync_message
 from sync.incremental import (
     bulk_mark_locations_seen,
+    folder_uid_list_state_unchanged,
     folder_scan_state_unchanged,
     incremental_candidate_uids,
     upsert_folder_scan_state,
@@ -287,6 +288,28 @@ def command_sync(
                     ):
                         folder_status = None
                     uids = search_uids(source)
+                    if (
+                        watermark_allowed
+                        and folder_status is not None
+                        and int(folder_status[1]) <= 0
+                        and folder_uid_list_state_unchanged(
+                            db,
+                            email,
+                            folder.raw_name,
+                            folder_status,
+                            uids,
+                            scan_signature,
+                            target_email,
+                            target_service_address,
+                        )
+                    ):
+                        watermark_unchanged_folders.add(
+                            (folder.raw_name, int(uidvalidity))
+                        )
+                        summary["folder_uid_list_unchanged"] = (
+                            summary.get("folder_uid_list_unchanged", 0) + 1
+                        )
+                        continue
                     if incremental_only:
                         uids = incremental_candidate_uids(
                             db,
@@ -551,6 +574,7 @@ def command_sync(
                             scan_signature,
                             target_email,
                             target_service_address,
+                            source_uids=uids,
                         )
                     db.commit()
                     if not source_scan_complete:
