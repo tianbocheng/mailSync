@@ -124,7 +124,12 @@ from imap.target import (
     replace_target_copy,
     target_fetch,
 )
-from monitoring.listener import monitor_realtime_changes, monitor_source_changes
+from monitoring.listener import (
+    SOURCE_CLIENT_LEASE_KEY,
+    monitor_realtime_changes,
+    monitor_source_changes,
+    release_source_client_lease,
+)
 from sync.schedule import build_source_schedule, refresh_source_schedule
 from sync.settings import DEFAULT_SYNC_INTERVAL_SECONDS
 
@@ -168,6 +173,7 @@ def command_sync(
     newest_first: bool,
     incremental_only: bool = False,
     sync_source: str = "imap_scan",
+    preconnected_source: Optional[imaplib.IMAP4] = None,
 ) -> int:
     if incremental_only and only_folder is None:
         raise SyncError("Fast incremental sync requires one source folder")
@@ -211,7 +217,18 @@ def command_sync(
             source_processed = 0
             source_scan_complete = True
             watermark_unchanged_folders: Set[Tuple[str, int]] = set()
-            source = connect(profiles[email])
+            source = preconnected_source
+            if source is None:
+                source = connect(profiles[email])
+            else:
+                emit_json(
+                    {
+                        "event": "source_monitor_connection_reused",
+                        "source": email,
+                        "folder": only_folder or "",
+                    }
+                )
+            preconnected_source = None
             try:
                 folders = selectable_source_folders(list_folders(source), rule)
                 if only_folder:
@@ -714,6 +731,7 @@ def command_watch(
             )
             if change is not None:
                 if change["email"] not in {rule["email"] for rule in rules}:
+                    release_source_client_lease(change)
                     continue
                 cycle += 1
                 print(
@@ -747,6 +765,7 @@ def command_watch(
                         True,
                         incremental_only=not change["uidvalidity_changed"],
                         sync_source=_change_sync_source(change),
+                        preconnected_source=_leased_source_client(change),
                     )
                     success = True
                     _mark_schedule_monitor_synced(
@@ -802,6 +821,8 @@ def command_watch(
                             file=sys.stderr,
                             flush=True,
                         )
+                finally:
+                    release_source_client_lease(change)
             else:
                 if pending_changes:
                     continue
@@ -922,6 +943,13 @@ def command_watch(
     finally:
         for record in monitor_records.values():
             record["stop_event"].set()
+        for change in pending_changes.values():
+            release_source_client_lease(change)
+        while True:
+            try:
+                release_source_client_lease(changes.get_nowait())
+            except queue.Empty:
+                break
         for record in monitor_records.values():
             record["thread"].join(timeout=2)
 
@@ -934,6 +962,10 @@ def _enqueue_pending_change(
     existing = pending_changes.get(key)
     queued = dict(change)
     if existing is not None:
+        existing_lease = existing.get(SOURCE_CLIENT_LEASE_KEY)
+        queued_lease = queued.get(SOURCE_CLIENT_LEASE_KEY)
+        if existing_lease is not None and existing_lease is not queued_lease:
+            release_source_client_lease(existing)
         for field in ("_queued_at", "_retry_at", "_retry_attempt"):
             if field in existing:
                 queued[field] = existing[field]
@@ -983,10 +1015,18 @@ def _schedule_incremental_retry(
         return None
     retry_delay = INCREMENTAL_SYNC_RETRY_DELAYS[retry_attempt - 1]
     retry_change = dict(change)
+    retry_change.pop(SOURCE_CLIENT_LEASE_KEY, None)
     retry_change["_retry_attempt"] = retry_attempt
     retry_change["_retry_at"] = time.monotonic() + retry_delay
     pending_changes[(change["email"], change["folder"])] = retry_change
     return retry_attempt, retry_delay
+
+
+def _leased_source_client(change: dict) -> Optional[imaplib.IMAP4]:
+    lease = change.get(SOURCE_CLIENT_LEASE_KEY)
+    if not isinstance(lease, dict):
+        return None
+    return lease.get("client")
 
 
 def _source_realtime_poll_interval(profile: dict, default: float) -> float:

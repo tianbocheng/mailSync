@@ -18,10 +18,25 @@ from imap.source import list_folders, mailbox_status, selectable_source_folders
 DEFAULT_IDLE_RESTART_SECONDS = 20 * 60
 DEFAULT_IDLE_ERROR_FALLBACK_THRESHOLD = 3
 DEFAULT_IDLE_MISSED_PUSH_FALLBACK_THRESHOLD = 3
+SOURCE_CLIENT_LEASE_KEY = "_source_client_lease"
 
 
 class IdleUnsupported(SyncError):
     pass
+
+
+def release_source_client_lease(change: dict) -> None:
+    lease = change.pop(SOURCE_CLIENT_LEASE_KEY, None)
+    if not isinstance(lease, dict):
+        return
+    client = lease.get("client")
+    if client is not None:
+        safe_logout(client)
+        lease["client"] = None
+
+
+def _lease_source_client(client: imaplib.IMAP4) -> dict:
+    return {"client": client}
 
 
 def _capability_names(client: imaplib.IMAP4) -> set[str]:
@@ -263,6 +278,10 @@ def monitor_inbox_idle_changes(
                         file=sys.stderr,
                         flush=True,
                     )
+                lease = _lease_source_client(client)
+                client = None
+                if monitor_state is not None:
+                    monitor_state["ready"] = False
                 changes.put(
                     {
                         "email": email,
@@ -276,6 +295,7 @@ def monitor_inbox_idle_changes(
                         ),
                         "previous": previous,
                         "current": current,
+                        SOURCE_CLIENT_LEASE_KEY: lease,
                     }
                 )
                 previous = current
@@ -283,6 +303,7 @@ def monitor_inbox_idle_changes(
                     raise IdleUnsupported(
                         "IMAP IDLE missed repeated INBOX changes; falling back to polling"
                     )
+                break
             consecutive_errors = 0
         except IdleUnsupported:
             raise
@@ -314,6 +335,8 @@ def monitor_inbox_idle_changes(
                     "IMAP IDLE failed repeatedly; falling back to polling"
                 ) from exc
         finally:
+            if monitor_state is not None:
+                monitor_state["ready"] = False
             if client is not None:
                 safe_logout(client)
         stop_event.wait(reconnect_delay)
@@ -452,6 +475,7 @@ def monitor_source_changes(
                 flush=True,
             )
             while not stop_event.wait(poll_interval):
+                transferred = False
                 for folder in folders:
                     current = mailbox_status(client, folder.raw_name)
                     previous = snapshots[folder.raw_name]
@@ -463,6 +487,10 @@ def monitor_source_changes(
                             int(monitor_state.get("change_version", 0)) + 1
                         )
                         monitor_state["snapshots"] = dict(snapshots)
+                    lease = _lease_source_client(client)
+                    client = None
+                    if monitor_state is not None:
+                        monitor_state["ready"] = False
                     changes.put(
                         {
                             "email": email,
@@ -471,8 +499,13 @@ def monitor_source_changes(
                             "uidvalidity_changed": current[0] != previous[0],
                             "previous": previous,
                             "current": current,
+                            SOURCE_CLIENT_LEASE_KEY: lease,
                         }
                     )
+                    transferred = True
+                    break
+                if transferred:
+                    break
         except (
             SyncError,
             imaplib.IMAP4.error,
@@ -496,6 +529,8 @@ def monitor_source_changes(
                     flush=True,
                 )
         finally:
+            if monitor_state is not None:
+                monitor_state["ready"] = False
             if client is not None:
                 safe_logout(client)
         stop_event.wait(reconnect_delay)

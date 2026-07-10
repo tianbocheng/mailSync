@@ -414,6 +414,10 @@ class RealtimeIncrementalTests(unittest.TestCase):
         self.assertEqual(change["email"], "source@example.com")
         self.assertEqual(change["folder"], "INBOX")
         self.assertEqual(change["current"], (1, 11, 10))
+        self.assertIs(
+            change[listener_module.SOURCE_CLIENT_LEASE_KEY]["client"],
+            client,
+        )
 
     def test_source_monitor_checks_inbox_first(self):
         changes = mail_sync.queue.Queue()
@@ -501,6 +505,10 @@ class RealtimeIncrementalTests(unittest.TestCase):
         self.assertEqual(change["folder"], "INBOX")
         self.assertFalse(change["uidvalidity_changed"])
         self.assertEqual(change["current"], (1, 11, 10))
+        self.assertIs(
+            change[listener_module.SOURCE_CLIENT_LEASE_KEY]["client"],
+            client,
+        )
         self.assertAlmostEqual(idle_wait.call_args.args[2], 1200, places=3)
 
     def test_inbox_idle_monitor_uses_compensation_probe(self):
@@ -605,7 +613,14 @@ class RealtimeIncrementalTests(unittest.TestCase):
         client = mock.Mock()
         client.capabilities = (b"IMAP4rev1", b"IDLE")
         folder = mail_sync.FolderInfo("INBOX", "INBOX", ())
-        statuses = [(1, 10, 9), (1, 11, 10), (1, 12, 11), (1, 13, 12)]
+        statuses = [
+            (1, 10, 9),
+            (1, 11, 10),
+            (1, 11, 10),
+            (1, 12, 11),
+            (1, 12, 11),
+            (1, 13, 12),
+        ]
 
         with (
             mock.patch.object(listener_module, "connect", return_value=client),
