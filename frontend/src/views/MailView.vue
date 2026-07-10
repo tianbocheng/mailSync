@@ -79,6 +79,10 @@
       width="860px"
       append-to-body
       destroy-on-close
+      :before-close="handleDialogBeforeClose"
+      :close-on-click-modal="!dialogBusy"
+      :close-on-press-escape="!dialogBusy"
+      :show-close="!dialogBusy"
       @close="closeDialog"
     >
       <LabelsPanel
@@ -90,12 +94,14 @@
         v-else-if="dialog === 'outlook' || (dialog === 'edit' && isOutlookMailbox(mailbox))"
         :detail="detail"
         :mailbox="mailbox"
+        @busy-change="handleDialogBusyChange"
       />
       <MailboxForm
         v-else
         :detail="detail"
         :mailbox="mailbox"
         :is-new="dialog === 'new'"
+        @busy-change="handleDialogBusyChange"
       />
     </el-dialog>
   </section>
@@ -131,6 +137,7 @@ const pageSize = ref(10);
 const outlookLoading = ref(false);
 const outlookCompleting = ref(false);
 const outlookResult = ref(null);
+const dialogBusy = ref(false);
 let outlookPopup = null;
 let outlookTimer = null;
 let outlookMessageHandler = null;
@@ -172,6 +179,7 @@ watch(
   () => {
     query.value = paramsFromSearch(props.search).get("mail_query") || "";
     currentPage.value = 1;
+    dialogBusy.value = false;
   },
   { immediate: true },
 );
@@ -204,7 +212,17 @@ function openMailbox(row, nextDialog) {
 }
 
 function closeDialog() {
+  if (dialogBusy.value) return;
   emit("navigate", { path: "/mail" });
+}
+
+function handleDialogBeforeClose(done) {
+  if (dialogBusy.value) return;
+  done();
+}
+
+function handleDialogBusyChange(value) {
+  dialogBusy.value = Boolean(value);
 }
 
 async function deleteMailbox(row) {

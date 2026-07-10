@@ -1,5 +1,10 @@
 <template>
-  <el-form label-position="top" @submit.prevent>
+  <el-form
+    v-loading="testing"
+    element-loading-text="正在测试邮箱服务..."
+    label-position="top"
+    @submit.prevent
+  >
     <el-row :gutter="12">
       <el-col :span="12">
         <el-form-item label="邮箱地址" required>
@@ -172,6 +177,7 @@ const props = defineProps({
     default: null,
   },
 });
+const emit = defineEmits(["busy-change"]);
 
 const account = computed(() => props.mailbox || {});
 const saving = ref(false);
@@ -231,6 +237,13 @@ watch(
     form.imap = protocolModel(props.mailbox || {});
   },
   { immediate: true },
+);
+
+watch(
+  testing,
+  (value) => {
+    emit("busy-change", value);
+  },
 );
 
 function protocolModel(item) {
