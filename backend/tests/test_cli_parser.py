@@ -118,6 +118,80 @@ class IncrementalRetryTests(unittest.TestCase):
         )
 
 
+class SourceConnectionLeaseTests(unittest.TestCase):
+    def test_command_sync_returns_borrowed_source_without_logout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.sqlite3"
+            source = mock.Mock()
+            target = mock.Mock()
+            lease = mail_sync.SourceClientLease(source)
+            target_profile = {
+                "email": "target@example.com",
+                "service_address": "imap.target",
+                "imap_server": "imap.target",
+                "folder": "INBOX",
+            }
+            config = {
+                "target": target_profile,
+                "synology_labels": {},
+                "sources": [
+                    {
+                        "email": "source@example.com",
+                        "account_label": "",
+                        "default_folder_label": "",
+                    }
+                ],
+            }
+            profiles = {
+                "source@example.com": {"email": "source@example.com"},
+                "target@example.com": target_profile,
+            }
+
+            with (
+                mock.patch.object(mail_sync, "connect", return_value=target) as connect,
+                mock.patch.object(
+                    mail_sync,
+                    "recover_pending_operations",
+                    return_value=0,
+                ),
+                mock.patch.object(mail_sync, "list_folders", return_value=[]),
+                mock.patch.object(
+                    mail_sync,
+                    "reconcile_deleted_messages",
+                    return_value=0,
+                ),
+                mock.patch.object(mail_sync, "safe_logout") as logout,
+                mock.patch.object(mail_sync, "emit_json"),
+            ):
+                mail_sync.command_sync(
+                    config,
+                    profiles,
+                    {},
+                    state_path,
+                    "source@example.com",
+                    None,
+                    None,
+                    True,
+                    source_lease=lease,
+                )
+
+        connect.assert_called_once_with(target_profile)
+        self.assertIs(lease.client_for_sync(), source)
+        self.assertNotIn(mock.call(source), logout.call_args_list)
+        self.assertIn(mock.call(target), logout.call_args_list)
+
+    def test_invalidated_lease_is_not_reused(self):
+        client = mock.Mock()
+        lease = mail_sync.SourceClientLease(client)
+
+        lease.invalidate()
+        returned, reusable = lease.wait_for_return(mock.Mock(is_set=lambda: False))
+
+        self.assertIs(returned, client)
+        self.assertFalse(reusable)
+        self.assertIsNone(lease.client_for_sync())
+
+
 class ScheduleRefreshTests(unittest.TestCase):
     def test_build_initial_schedule_uses_source_interval_for_staggering(self):
         rules = [

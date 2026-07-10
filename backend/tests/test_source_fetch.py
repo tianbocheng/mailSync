@@ -1,4 +1,5 @@
 import json
+import queue
 import tempfile
 import time
 import unittest
@@ -234,6 +235,13 @@ class SourceReconnectTests(unittest.TestCase):
         )
 
 class RealtimeIncrementalTests(unittest.TestCase):
+    class ReturningQueue(queue.Queue):
+        def put(self, item, block=True, timeout=None):
+            super().put(item, block=block, timeout=timeout)
+            lease = listener_module.source_client_lease(item)
+            if lease is not None:
+                lease.return_to_monitor()
+
     class OnePollStopEvent:
         def __init__(self):
             self.waits = 0
@@ -258,6 +266,21 @@ class RealtimeIncrementalTests(unittest.TestCase):
 
         def wait(self, _timeout):
             return self.stopped
+
+    class TwoPollStopEvent:
+        def __init__(self):
+            self.waits = 0
+            self.stopped = False
+
+        def is_set(self):
+            return self.stopped
+
+        def wait(self, _timeout):
+            self.waits += 1
+            if self.waits <= 2:
+                return False
+            self.stopped = True
+            return True
 
     def test_status_response_is_parsed_independent_of_value_order(self):
         result = mail_sync.parse_mailbox_status(
@@ -386,9 +409,10 @@ class RealtimeIncrementalTests(unittest.TestCase):
         )
 
     def test_source_monitor_queues_changed_folder(self):
-        changes = mail_sync.queue.Queue()
+        changes = self.ReturningQueue()
         stop_event = self.OnePollStopEvent()
         client = mock.Mock()
+        client.noop.return_value = ("OK", [b"alive"])
         folder = mail_sync.FolderInfo("INBOX", "INBOX", ())
         with (
             mock.patch.object(listener_module, "connect", return_value=client),
@@ -414,10 +438,9 @@ class RealtimeIncrementalTests(unittest.TestCase):
         self.assertEqual(change["email"], "source@example.com")
         self.assertEqual(change["folder"], "INBOX")
         self.assertEqual(change["current"], (1, 11, 10))
-        self.assertIs(
-            change[listener_module.SOURCE_CLIENT_LEASE_KEY]["client"],
-            client,
-        )
+        lease = listener_module.source_client_lease(change)
+        self.assertIsNotNone(lease)
+        self.assertIs(lease.client_for_sync(), client)
 
     def test_source_monitor_checks_inbox_first(self):
         changes = mail_sync.queue.Queue()
@@ -457,8 +480,46 @@ class RealtimeIncrementalTests(unittest.TestCase):
         self.assertEqual(checked[:3], ["INBOX", "Sent Items", "Trash"])
         self.assertEqual(checked[3:6], ["INBOX", "Sent Items", "Trash"])
 
+    def test_source_poll_monitor_reuses_connection_after_sync(self):
+        changes = self.ReturningQueue()
+        stop_event = self.TwoPollStopEvent()
+        client = mock.Mock()
+        client.noop.return_value = ("OK", [b"alive"])
+        folder = mail_sync.FolderInfo("INBOX", "INBOX", ())
+        with (
+            mock.patch.object(
+                listener_module,
+                "connect",
+                return_value=client,
+            ) as connect,
+            mock.patch.object(listener_module, "list_folders", return_value=[folder]),
+            mock.patch.object(
+                listener_module,
+                "mailbox_status",
+                side_effect=[(1, 10, 9), (1, 11, 10), (1, 12, 11)],
+            ),
+            mock.patch.object(listener_module, "safe_logout"),
+            mock.patch("builtins.print"),
+        ):
+            mail_sync.monitor_source_changes(
+                {"email": "source@example.com"},
+                {"email": "source@example.com"},
+                None,
+                1,
+                changes,
+                stop_event,
+            )
+
+        self.assertEqual(changes.qsize(), 2)
+        self.assertEqual(connect.call_count, 1)
+        connection_ids = {
+            listener_module.source_client_lease(change).connection_id
+            for change in list(changes.queue)
+        }
+        self.assertEqual(len(connection_ids), 1)
+
     def test_inbox_idle_monitor_queues_changed_inbox(self):
-        changes = mail_sync.queue.Queue()
+        changes = self.ReturningQueue()
         stop_event = self.ManualStopEvent()
         client = mock.Mock()
         client.capabilities = (b"IMAP4rev1", b"IDLE")
@@ -505,14 +566,13 @@ class RealtimeIncrementalTests(unittest.TestCase):
         self.assertEqual(change["folder"], "INBOX")
         self.assertFalse(change["uidvalidity_changed"])
         self.assertEqual(change["current"], (1, 11, 10))
-        self.assertIs(
-            change[listener_module.SOURCE_CLIENT_LEASE_KEY]["client"],
-            client,
-        )
+        lease = listener_module.source_client_lease(change)
+        self.assertIsNotNone(lease)
+        self.assertIs(lease.client_for_sync(), client)
         self.assertAlmostEqual(idle_wait.call_args.args[2], 1200, places=3)
 
     def test_inbox_idle_monitor_uses_compensation_probe(self):
-        changes = mail_sync.queue.Queue()
+        changes = self.ReturningQueue()
         stop_event = self.ManualStopEvent()
         client = mock.Mock()
         client.capabilities = (b"IMAP4rev1", b"IDLE")
@@ -608,22 +668,25 @@ class RealtimeIncrementalTests(unittest.TestCase):
         self.assertEqual(connect.call_count, 3)
 
     def test_idle_monitor_degrades_after_repeated_missed_pushes(self):
-        changes = mail_sync.queue.Queue()
+        changes = self.ReturningQueue()
         stop_event = self.ManualStopEvent()
         client = mock.Mock()
         client.capabilities = (b"IMAP4rev1", b"IDLE")
+        client.noop.return_value = ("OK", [b"alive"])
         folder = mail_sync.FolderInfo("INBOX", "INBOX", ())
         statuses = [
             (1, 10, 9),
             (1, 11, 10),
-            (1, 11, 10),
-            (1, 12, 11),
             (1, 12, 11),
             (1, 13, 12),
         ]
 
         with (
-            mock.patch.object(listener_module, "connect", return_value=client),
+            mock.patch.object(
+                listener_module,
+                "connect",
+                return_value=client,
+            ) as connect,
             mock.patch.object(listener_module, "list_folders", return_value=[folder]),
             mock.patch.object(
                 listener_module,
@@ -655,6 +718,12 @@ class RealtimeIncrementalTests(unittest.TestCase):
                 )
 
         self.assertEqual(changes.qsize(), 3)
+        self.assertEqual(connect.call_count, 1)
+        connection_ids = {
+            listener_module.source_client_lease(change).connection_id
+            for change in list(changes.queue)
+        }
+        self.assertEqual(len(connection_ids), 1)
 
     def test_realtime_monitor_uses_saved_idle_feature(self):
         changes = mail_sync.queue.Queue()
