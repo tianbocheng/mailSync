@@ -1620,6 +1620,146 @@ class SourceUnavailableSeenTests(unittest.TestCase):
             self.assertNotEqual(row["last_seen_run"], "old-run")
 
 
+class FolderWatermarkScanTests(unittest.TestCase):
+    def test_full_scan_skips_unchanged_folder_watermark(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.sqlite3"
+            db = mail_sync.init_db(state_path)
+            raw = b"Subject: cached\r\n\r\nbody\r\n"
+            message = mail_sync.SourceMessage(
+                source_email="source@example.com",
+                folder="INBOX",
+                uidvalidity=1,
+                uid=10,
+                raw=raw,
+                content_hash=mail_sync.content_hash(raw),
+                message_id="<cached@example.com>",
+                internal_date=datetime(2024, 1, 1, tzinfo=timezone.utc),
+                system_flags=(),
+            )
+            mail_sync.upsert_state(
+                db,
+                message,
+                2,
+                20,
+                "SYNC:source@example.com",
+                ("BOX:收件箱",),
+                "old-run",
+                target_folder="INBOX",
+                target_email="target@example.com",
+                target_service_address="imap.target",
+            )
+            mail_sync.upsert_message_location(
+                db,
+                message,
+                "BOX:收件箱",
+                "old-run",
+            )
+            rule = {
+                "email": "source@example.com",
+                "account_label": "SYNC:source@example.com",
+                "default_folder_label": "BOX:收件箱",
+            }
+            labels_by_name = {
+                "SYNC:source@example.com": "$account",
+                "BOX:收件箱": "$inbox",
+            }
+            signature = mail_sync._folder_scan_signature(
+                rule,
+                ("BOX:收件箱",),
+                set(),
+                "INBOX",
+                labels_by_name,
+            )
+            mail_sync.upsert_folder_scan_state(
+                db,
+                "source@example.com",
+                "INBOX",
+                (1, 11, 1),
+                "old-run",
+                signature,
+                "target@example.com",
+                "imap.target",
+            )
+            db.commit()
+            db.close()
+
+            target = {
+                "email": "target@example.com",
+                "service_address": "imap.target",
+                "folder": "INBOX",
+            }
+            config = {
+                "target": target,
+                "synology_labels": {
+                    "$account": "SYNC:source@example.com",
+                    "$inbox": "BOX:收件箱",
+                },
+                "sources": [rule],
+            }
+            profiles = {
+                "source@example.com": {"email": "source@example.com"},
+                "target@example.com": target,
+            }
+
+            with (
+                mock.patch.object(
+                    mail_sync,
+                    "connect",
+                    side_effect=[mock.Mock(), mock.Mock()],
+                ),
+                mock.patch.object(
+                    mail_sync,
+                    "recover_pending_operations",
+                    return_value=0,
+                ),
+                mock.patch.object(
+                    mail_sync,
+                    "list_folders",
+                    return_value=[mail_sync.FolderInfo("INBOX", "INBOX", ())],
+                ),
+                mock.patch.object(
+                    mail_sync,
+                    "mailbox_status",
+                    return_value=(1, 11, 1),
+                ),
+                mock.patch.object(mail_sync, "select_mailbox") as select,
+                mock.patch.object(mail_sync, "search_uids") as search,
+                mock.patch.object(
+                    mail_sync,
+                    "reconcile_deleted_messages",
+                    return_value=0,
+                ),
+            ):
+                mail_sync.command_sync(
+                    config,
+                    profiles,
+                    labels_by_name,
+                    state_path,
+                    "source@example.com",
+                    None,
+                    None,
+                    True,
+                )
+
+            select.assert_not_called()
+            search.assert_not_called()
+            db = mail_sync.init_db(state_path)
+            try:
+                location = db.execute(
+                    """
+                    SELECT last_seen_run
+                    FROM message_locations
+                    WHERE source_email=? AND content_hash=?
+                    """,
+                    (message.source_email, message.content_hash),
+                ).fetchone()
+            finally:
+                db.close()
+            self.assertIsNotNone(location)
+            self.assertNotEqual(location["last_seen_run"], "old-run")
+
+
 class PendingMultiLabelTests(unittest.TestCase):
     def test_pending_operation_falls_back_to_search_when_uidnext_is_invalid(self):
         with tempfile.TemporaryDirectory() as directory:

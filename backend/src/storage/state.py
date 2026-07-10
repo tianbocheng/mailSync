@@ -11,7 +11,7 @@ from domain.message import message_subject
 from storage.config_db import ensure_config_tables
 
 
-DB_SCHEMA_VERSION = 9
+DB_SCHEMA_VERSION = 10
 DB_BUSY_TIMEOUT_SECONDS = 30
 
 
@@ -115,6 +115,22 @@ def init_db(path: Path) -> sqlite3.Connection:
         );
         CREATE INDEX IF NOT EXISTS message_locations_content
         ON message_locations(source_email, content_hash);
+        CREATE TABLE IF NOT EXISTS source_folder_scan_state (
+            source_email TEXT NOT NULL,
+            source_folder TEXT NOT NULL,
+            target_email TEXT NOT NULL DEFAULT '',
+            target_service_address TEXT NOT NULL DEFAULT '',
+            source_uidvalidity INTEGER NOT NULL,
+            source_uidnext INTEGER NOT NULL,
+            source_messages INTEGER NOT NULL,
+            scan_signature TEXT NOT NULL DEFAULT '',
+            last_complete_run TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (
+                source_email, source_folder,
+                target_email, target_service_address
+            )
+        );
         """
     )
     ensure_config_tables(connection)

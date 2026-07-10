@@ -90,7 +90,10 @@ from storage.rule_status import mark_sync_rule_failure, mark_sync_rule_success
 from sync.engine import purge_single_location_message, sync_message
 from sync.incremental import (
     bulk_mark_locations_seen,
+    folder_scan_state_unchanged,
     incremental_candidate_uids,
+    mark_folder_locations_seen,
+    upsert_folder_scan_state,
     verified_known_location_uids,
 )
 from sync.labels import normalize_folder_labels, row_folder_labels
@@ -127,6 +130,27 @@ from sync.settings import DEFAULT_SYNC_INTERVAL_SECONDS
 
 
 RUN_CHILD_STOP_TIMEOUT_SECONDS = 8.0
+
+
+def _folder_scan_signature(
+    rule: dict,
+    folder_labels: Sequence[str],
+    skipped_uids: Set[int],
+    target_folder: str,
+    labels_by_name: Dict[str, str],
+) -> str:
+    return json.dumps(
+        {
+            "account_label": rule.get("account_label") or "",
+            "folder_labels": list(folder_labels),
+            "labels_by_name": sorted(labels_by_name.items()),
+            "skip_deleted_drafts": bool(rule.get("skip_deleted_drafts", False)),
+            "skipped_uids": sorted(int(uid) for uid in skipped_uids),
+            "target_folder": target_folder,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
 
 
 def command_sync(
@@ -200,11 +224,79 @@ def command_sync(
                         folder,
                         target_rule["folder"],
                     )
+                    folder_labels = source_folder_labels(rule, folder)
+                    skipped_uids = source_folder_skipped_uids(rule, folder)
+                    inspect_deleted_drafts = (
+                        rule.get("skip_deleted_drafts", False)
+                        and rule.get("deleted_label") in folder_labels
+                    )
+                    scan_signature = _folder_scan_signature(
+                        rule,
+                        folder_labels,
+                        skipped_uids,
+                        target_folder,
+                        rule_labels_by_name,
+                    )
+                    folder_status = None
+                    watermark_allowed = (
+                        not incremental_only
+                        and only_folder is None
+                        and not inspect_deleted_drafts
+                    )
+                    if watermark_allowed:
+                        try:
+                            folder_status = mailbox_status(source, folder.raw_name)
+                        except (SyncError, TypeError, ValueError) as exc:
+                            emit_json(
+                                {
+                                    "event": "source_folder_watermark_unavailable",
+                                    "source": email,
+                                    "folder": folder.display_name,
+                                    "reason": str(exc),
+                                }
+                            )
+                        if (
+                            folder_status is not None
+                            and folder_scan_state_unchanged(
+                                db,
+                                email,
+                                folder.raw_name,
+                                folder_status,
+                                scan_signature,
+                                target_email,
+                                target_service_address,
+                            )
+                        ):
+                            seen_count = mark_folder_locations_seen(
+                                db,
+                                email,
+                                folder.raw_name,
+                                folder_status[0],
+                                run_id,
+                                target_email,
+                                target_service_address,
+                            )
+                            summary["folder_watermark_unchanged"] = (
+                                summary.get("folder_watermark_unchanged", 0)
+                                + 1
+                            )
+                            summary["folder_watermark_seen"] = (
+                                summary.get("folder_watermark_seen", 0)
+                                + seen_count
+                            )
+                            db.commit()
+                            continue
                     _, uidvalidity = select_mailbox(
                         source,
                         folder.raw_name,
                         readonly=True,
                     )
+                    folder_scan_complete = True
+                    if (
+                        folder_status is not None
+                        and int(folder_status[0]) != int(uidvalidity)
+                    ):
+                        folder_status = None
                     uids = search_uids(source)
                     if incremental_only:
                         uids = incremental_candidate_uids(
@@ -216,12 +308,6 @@ def command_sync(
                             target_email,
                             target_service_address,
                         )
-                    skipped_uids = source_folder_skipped_uids(rule, folder)
-                    inspect_deleted_drafts = (
-                        rule.get("skip_deleted_drafts", False)
-                        and rule.get("deleted_label")
-                        in source_folder_labels(rule, folder)
-                    )
                     if not incremental_only and not inspect_deleted_drafts:
                         verified_uids = verified_known_location_uids(
                             db,
@@ -321,6 +407,7 @@ def command_sync(
                                 continue
                             if limit is not None and source_processed >= limit:
                                 source_scan_complete = False
+                                folder_scan_complete = False
                                 break
                             source_processed += 1
                             try:
@@ -333,6 +420,7 @@ def command_sync(
                                     profiles[email],
                                 )
                             except SourceMessageUnavailable as exc:
+                                watermark_allowed = False
                                 if known is not None:
                                     db.execute(
                                         """
@@ -420,7 +508,7 @@ def command_sync(
                                     target_folder,
                                     message,
                                     rule["account_label"],
-                                    source_folder_labels(rule, folder),
+                                    folder_labels,
                                     rule_labels_by_name,
                                     run_id,
                                     commit_state=False,
@@ -460,6 +548,21 @@ def command_sync(
                                     "uid": uid,
                                 }
                             )
+                    if (
+                        watermark_allowed
+                        and folder_scan_complete
+                        and folder_status is not None
+                    ):
+                        upsert_folder_scan_state(
+                            db,
+                            email,
+                            folder.raw_name,
+                            folder_status,
+                            run_id,
+                            scan_signature,
+                            target_email,
+                            target_service_address,
+                        )
                     db.commit()
                     if not source_scan_complete:
                         break
