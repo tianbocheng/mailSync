@@ -279,8 +279,11 @@ def load_runtime_config(
     db: sqlite3.Connection,
     state_path: Path,
     include_source_email: str | None = None,
+    *,
+    ensure_schema: bool = True,
 ) -> dict:
-    ensure_config_tables(db)
+    if ensure_schema:
+        ensure_config_tables(db)
     params: tuple[str, ...] = ()
     source_filter = "enabled=1"
     if include_source_email:

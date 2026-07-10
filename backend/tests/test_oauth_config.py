@@ -534,6 +534,26 @@ class SqliteConfigTests(unittest.TestCase):
             "source.example.com",
         )
 
+    def test_runtime_config_can_skip_schema_checks_after_initialization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.sqlite3"
+            db = mail_sync.init_db(path)
+            try:
+                mail_sync.import_legacy_config(db, self.valid_config())
+                with mock.patch(
+                    "storage.config_db.ensure_config_tables"
+                ) as ensure_config_tables:
+                    loaded = mail_sync.load_runtime_config(
+                        db,
+                        path,
+                        ensure_schema=False,
+                    )
+            finally:
+                db.close()
+
+        ensure_config_tables.assert_not_called()
+        self.assertEqual(loaded["sources"][0]["email"], "same@example.com")
+
     def test_init_db_migrates_outlook_token_file_into_auth_json(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.sqlite3"

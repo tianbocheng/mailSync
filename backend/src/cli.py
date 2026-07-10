@@ -84,7 +84,7 @@ from imap.source import (
     pop_retrieve_raw,
     selectable_source_folders,
 )
-from storage.state import DB_SCHEMA_VERSION, init_db, process_lock
+from storage.state import DB_SCHEMA_VERSION, connect_db, init_db, process_lock
 from storage.config_db import import_legacy_config, load_runtime_config
 from storage.rule_status import mark_sync_rule_failure, mark_sync_rule_success
 from sync.engine import purge_single_location_message, sync_message
@@ -1274,9 +1274,13 @@ def _watch_runtime_context(
     state_path: Path,
     source_email: Optional[str],
 ) -> tuple[dict, Dict[str, dict], Dict[str, str], list[dict]]:
-    db = init_db(state_path)
+    db = connect_db(state_path)
     try:
-        config = _load_watch_runtime_config(db, state_path)
+        config = _load_watch_runtime_config(
+            db,
+            state_path,
+            ensure_schema=False,
+        )
     finally:
         db.close()
     labels_by_name = label_id_map(config.get("synology_labels"))
@@ -1291,9 +1295,18 @@ def _watch_runtime_context(
     return config, profiles, labels_by_name, rules
 
 
-def _load_watch_runtime_config(db: sqlite3.Connection, state_path: Path) -> dict:
+def _load_watch_runtime_config(
+    db: sqlite3.Connection,
+    state_path: Path,
+    *,
+    ensure_schema: bool = True,
+) -> dict:
     try:
-        return load_runtime_config(db, state_path)
+        return load_runtime_config(
+            db,
+            state_path,
+            ensure_schema=ensure_schema,
+        )
     except SyncError as exc:
         if str(exc).startswith("No target mailbox is configured"):
             return {
