@@ -303,6 +303,29 @@ class WebConsoleTests(unittest.TestCase):
             self.assertEqual(detail["mailbox"]["imap_server"], "imap.example.com")
             self.assertEqual(detail["mailbox"]["pop_server"], "")
 
+    def test_web_requests_do_not_reinitialize_state_schema(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.sqlite3"
+            db = mail_sync.init_db(state_path)
+            db.close()
+
+            raw = (
+                "GET /api/session HTTP/1.1\r\n"
+                "Host: localhost\r\n"
+                "\r\n"
+            ).encode("utf-8")
+            socket = FakeSocket(raw)
+
+            with mock.patch(
+                "web.app.init_db",
+                side_effect=AssertionError("init_db should only run at startup"),
+            ):
+                make_handler(state_path)(socket, ("127.0.0.1", 0), object())
+
+            status, _, body = parse_response(socket.output.getvalue())
+            self.assertEqual(status, 200)
+            self.assertFalse(json.loads(body)["authenticated"])
+
     def test_static_shell_session_and_api_pages(self):
         with tempfile.TemporaryDirectory() as directory:
             state_path = Path(directory) / "state.sqlite3"

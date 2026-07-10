@@ -51,7 +51,7 @@ from storage.config_repository import (
     target_mailbox_detail,
     update_synology_label,
 )
-from storage.state import init_db
+from storage.state import connect_db, init_db
 from storage.users import authenticate_user, find_user_by_username
 from web import session
 
@@ -1726,7 +1726,7 @@ def make_handler(state_path: Path) -> type[BaseHTTPRequestHandler]:
             return username
 
         def _db(self) -> sqlite3.Connection:
-            return init_db(state_path)
+            return connect_db(state_path)
 
         def _read_fields(self) -> dict[str, list[str]]:
             try:

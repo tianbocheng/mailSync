@@ -12,14 +12,21 @@ from storage.config_db import ensure_config_tables
 
 
 DB_SCHEMA_VERSION = 9
+DB_BUSY_TIMEOUT_SECONDS = 30
+
+
+def connect_db(path: Path) -> sqlite3.Connection:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(str(path), timeout=DB_BUSY_TIMEOUT_SECONDS)
+    connection.row_factory = sqlite3.Row
+    connection.execute(f"PRAGMA busy_timeout={DB_BUSY_TIMEOUT_SECONDS * 1000}")
+    connection.execute("PRAGMA foreign_keys=ON")
+    return connection
 
 
 def init_db(path: Path) -> sqlite3.Connection:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(str(path))
-    connection.row_factory = sqlite3.Row
+    connection = connect_db(path)
     connection.execute("PRAGMA journal_mode=WAL")
-    connection.execute("PRAGMA foreign_keys=ON")
     current_schema_version = int(
         connection.execute("PRAGMA user_version").fetchone()[0]
     )
