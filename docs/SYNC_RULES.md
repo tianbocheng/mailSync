@@ -209,15 +209,17 @@ docker compose -f deploy/compose.yaml up -d --build
 查看应用日志：
 
 ```bash
-tail -f logs/web.log
-tail -f logs/sync.log
+docker compose -f deploy/compose.yaml exec mail-sync tail -f /app/logs/web.log
+docker compose -f deploy/compose.yaml exec mail-sync tail -f /app/logs/sync.log
 ```
+
+日志目录和文件会分别收紧为 `0700`/`0600`，宿主机普通用户应通过容器读取。
 
 Web 控制台和同步子进程会分别写入挂载日志目录：
 
 ```bash
-tail -f logs/web.log
-tail -f logs/sync.log
+docker compose -f deploy/compose.yaml exec mail-sync tail -f /app/logs/web.log
+docker compose -f deploy/compose.yaml exec mail-sync tail -f /app/logs/sync.log
 ```
 
 日志默认按 20 MiB 轮转并各保留 10 份，可通过

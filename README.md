@@ -161,9 +161,11 @@ docker compose -f deploy/compose.yaml up -d --build
 View application logs:
 
 ```bash
-tail -f logs/web.log
-tail -f logs/sync.log
+docker compose -f deploy/compose.yaml exec mail-sync tail -f /app/logs/web.log
+docker compose -f deploy/compose.yaml exec mail-sync tail -f /app/logs/sync.log
 ```
+
+日志目录和文件会分别收紧为 `0700`/`0600`，因此建议通过容器读取。
 
 推荐使用带一致性备份、健康验证和失败回滚的重部署脚本：
 
