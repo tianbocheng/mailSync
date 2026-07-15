@@ -3,6 +3,7 @@ import io
 import json
 import os
 import tempfile
+import time
 import unittest
 from datetime import datetime, timezone
 from unittest import mock
@@ -34,7 +35,7 @@ from storage.config_db import import_legacy_config, load_runtime_config
 from storage.rule_status import mark_sync_rule_failure, mark_sync_rule_success
 from storage.users import authenticate_user
 from web.app import make_handler
-from web.session import current_username, make_session_cookie
+from web.session import clear_session_cookie, current_username, make_session_cookie
 
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
@@ -112,6 +113,39 @@ class WebConsoleTests(unittest.TestCase):
                 "$deleted": "BOX:已删除邮件",
             },
         }
+
+    def request_handler(
+        self,
+        handler,
+        path,
+        *,
+        method="GET",
+        form=None,
+        headers=None,
+        client_ip="127.0.0.1",
+    ):
+        body = json.dumps(form or {}).encode("utf-8")
+        raw_headers = [
+            f"{method} {path} HTTP/1.1",
+            "Host: localhost",
+        ]
+        for key, value in (headers or {}).items():
+            raw_headers.append(f"{key}: {value}")
+        if form is not None:
+            raw_headers.append("Content-Type: application/json")
+            raw_headers.append(f"Content-Length: {len(body)}")
+        raw = ("\r\n".join(raw_headers) + "\r\n\r\n").encode("utf-8") + body
+        socket = FakeSocket(raw)
+        handler(socket, (client_ip, 0), object())
+        return parse_response(socket.output.getvalue())
+
+    def write_heartbeat(self, root: Path, *, age_seconds: float = 0) -> Path:
+        path = root / "watch.heartbeat"
+        path.write_text("2026-01-01T00:00:00+00:00\n", encoding="utf-8")
+        if age_seconds:
+            timestamp = time.time() - age_seconds
+            os.utime(path, (timestamp, timestamp))
+        return path
 
     def test_mailbox_pop_connection_test_uses_pop_and_proxy(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -326,6 +360,409 @@ class WebConsoleTests(unittest.TestCase):
             status, _, body = parse_response(socket.output.getvalue())
             self.assertEqual(status, 200)
             self.assertFalse(json.loads(body)["authenticated"])
+
+    def test_live_api_is_public_and_requires_database_and_watch_heartbeat(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_path = root / "state.sqlite3"
+            db = mail_sync.init_db(state_path)
+            db.close()
+            self.write_heartbeat(root)
+
+            status, _, body = self.request_handler(
+                make_handler(state_path),
+                "/api/live",
+            )
+
+            data = json.loads(body)
+            self.assertEqual(status, 200)
+            self.assertTrue(data["healthy"])
+            self.assertEqual(data["checks"]["database"]["status"], "ok")
+            self.assertEqual(data["checks"]["heartbeat"]["status"], "ok")
+            self.assertEqual(
+                data["checks"]["heartbeat"]["max_age_seconds"],
+                600,
+            )
+            self.assertNotIn("rules", data["checks"])
+            self.assertNotIn("pending", data["checks"])
+
+    def test_health_api_is_public_and_reports_healthy_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_path = root / "state.sqlite3"
+            self.write_heartbeat(root)
+            db = mail_sync.init_db(state_path)
+            try:
+                import_legacy_config(db, self.valid_config())
+            finally:
+                db.close()
+
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "MAIL_SYNC_HEARTBEAT_MAX_AGE_SECONDS": "600",
+                },
+            ):
+                status, headers, body = self.request_handler(
+                    make_handler(state_path),
+                    "/api/health",
+                )
+
+            data = json.loads(body)
+            self.assertEqual(status, 200)
+            self.assertEqual(data["status"], "healthy")
+            self.assertTrue(data["healthy"])
+            self.assertEqual(data["checks"]["database"]["status"], "ok")
+            self.assertEqual(data["checks"]["rules"]["enabled"], 1)
+            self.assertEqual(data["checks"]["rules"]["failed"], 0)
+            self.assertEqual(data["checks"]["pending"]["count"], 0)
+            self.assertEqual(data["checks"]["heartbeat"]["status"], "ok")
+            self.assertNotIn("source@example.com", body.decode("utf-8"))
+            self.assertNotIn("secret", body.decode("utf-8"))
+            self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
+            self.assertEqual(headers["X-Frame-Options"], "DENY")
+            self.assertEqual(headers["Referrer-Policy"], "same-origin")
+            self.assertIn(
+                "style-src 'self' 'unsafe-inline'",
+                headers["Content-Security-Policy"],
+            )
+
+    def test_health_api_reports_enabled_rule_failure_without_details(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_path = root / "state.sqlite3"
+            self.write_heartbeat(root)
+            db = mail_sync.init_db(state_path)
+            try:
+                import_legacy_config(db, self.valid_config())
+                mark_sync_rule_failure(
+                    db,
+                    "source@example.com",
+                    "password secret for source@example.com failed",
+                )
+            finally:
+                db.close()
+
+            handler = make_handler(state_path)
+            status, _, body = self.request_handler(handler, "/api/health")
+
+            data = json.loads(body)
+            self.assertEqual(status, 503)
+            self.assertEqual(data["status"], "unhealthy")
+            self.assertEqual(data["checks"]["rules"]["failed"], 1)
+            self.assertNotIn("source@example.com", body.decode("utf-8"))
+            self.assertNotIn("password", body.decode("utf-8"))
+            self.assertNotIn("secret", body.decode("utf-8"))
+            live_status, _, live_body = self.request_handler(handler, "/api/live")
+            self.assertEqual(live_status, 200)
+            self.assertTrue(json.loads(live_body)["healthy"])
+
+    def test_health_api_reports_pending_operations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_path = root / "state.sqlite3"
+            self.write_heartbeat(root)
+            db = mail_sync.init_db(state_path)
+            try:
+                import_legacy_config(db, self.valid_config())
+                timestamp = "2026-01-01T00:00:00+00:00"
+                db.execute(
+                    """
+                    INSERT INTO pending_operations (
+                        source_email, content_hash, source_folder,
+                        source_uidvalidity, source_uid, source_flags,
+                        raw_message, account_label, folder_label,
+                        target_uidvalidity, target_uid_before, status,
+                        created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "source@example.com",
+                        "pending-hash",
+                        "INBOX",
+                        1,
+                        1,
+                        "[]",
+                        b"Subject: pending\r\n\r\nbody",
+                        "SYNC:source@example.com",
+                        "BOX:收件箱",
+                        1,
+                        1,
+                        "pending",
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                db.commit()
+            finally:
+                db.close()
+
+            status, _, body = self.request_handler(
+                make_handler(state_path),
+                "/api/health",
+            )
+
+            data = json.loads(body)
+            self.assertEqual(status, 503)
+            self.assertEqual(data["checks"]["pending"]["status"], "error")
+            self.assertEqual(data["checks"]["pending"]["count"], 1)
+            self.assertNotIn("source@example.com", body.decode("utf-8"))
+
+    def test_live_api_reports_stale_heartbeat_with_configured_threshold(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_path = root / "state.sqlite3"
+            heartbeat_path = root / "runtime" / "watch.heartbeat"
+            heartbeat_path.parent.mkdir()
+            heartbeat_path.write_text("alive\n", encoding="utf-8")
+            stale_time = time.time() - 31
+            os.utime(heartbeat_path, (stale_time, stale_time))
+            db = mail_sync.init_db(state_path)
+            db.close()
+
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "MAIL_SYNC_HEARTBEAT_PATH": str(heartbeat_path),
+                    "MAIL_SYNC_HEARTBEAT_MAX_AGE_SECONDS": "30",
+                },
+            ):
+                status, _, body = self.request_handler(
+                    make_handler(state_path),
+                    "/api/live",
+                )
+
+            data = json.loads(body)
+            self.assertEqual(status, 503)
+            self.assertEqual(data["checks"]["heartbeat"]["status"], "stale")
+            self.assertEqual(
+                data["checks"]["heartbeat"]["max_age_seconds"],
+                30,
+            )
+
+    def test_live_api_reports_missing_watch_heartbeat(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_path = root / "state.sqlite3"
+            db = mail_sync.init_db(state_path)
+            db.close()
+            status, _, body = self.request_handler(
+                make_handler(state_path),
+                "/api/live",
+            )
+
+            data = json.loads(body)
+            self.assertEqual(status, 503)
+            self.assertEqual(data["checks"]["heartbeat"]["status"], "missing")
+
+    def test_health_api_requires_watch_heartbeat_without_enabled_rules(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_path = root / "state.sqlite3"
+            db = mail_sync.init_db(state_path)
+            db.close()
+
+            status, _, body = self.request_handler(
+                make_handler(state_path),
+                "/api/health",
+            )
+
+            data = json.loads(body)
+            self.assertEqual(status, 503)
+            self.assertEqual(data["status"], "unhealthy")
+            self.assertEqual(data["checks"]["rules"]["enabled"], 0)
+            self.assertEqual(
+                data["checks"]["heartbeat"]["status"],
+                "missing",
+            )
+
+    def test_session_cookie_secure_flag_applies_to_set_and_clear(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.sqlite3"
+            db = mail_sync.init_db(state_path)
+            try:
+                with mock.patch.dict(
+                    os.environ,
+                    {"MAIL_SYNC_COOKIE_SECURE": "1"},
+                ):
+                    cookie = make_session_cookie(db, "admin")
+                    cleared = clear_session_cookie()
+                self.assertIn("; Secure", cookie)
+                self.assertIn("; Secure", cleared)
+
+                with mock.patch.dict(
+                    os.environ,
+                    {"MAIL_SYNC_COOKIE_SECURE": "0"},
+                ):
+                    cookie = make_session_cookie(db, "admin")
+                    cleared = clear_session_cookie()
+                self.assertNotIn("; Secure", cookie)
+                self.assertNotIn("; Secure", cleared)
+            finally:
+                db.close()
+
+    def test_login_api_rate_limits_by_socket_ip_and_username(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.sqlite3"
+            with mock.patch.dict(
+                os.environ,
+                {"MAIL_SYNC_ADMIN_PASSWORD": "test-admin-password"},
+            ):
+                db = mail_sync.init_db(state_path)
+            db.close()
+            handler = make_handler(state_path)
+            trust_proxy_patch = mock.patch.dict(
+                os.environ,
+                {"MAIL_SYNC_TRUST_PROXY": "0"},
+            )
+            trust_proxy_patch.start()
+            self.addCleanup(trust_proxy_patch.stop)
+            request_headers = {
+                "Accept": "application/json",
+                "X-Requested-With": "XMLHttpRequest",
+            }
+
+            for _ in range(4):
+                status, _, _ = self.request_handler(
+                    handler,
+                    "/api/login",
+                    method="POST",
+                    form={"username": "admin", "password": "wrong"},
+                    headers=request_headers,
+                    client_ip="192.0.2.10",
+                )
+                self.assertEqual(status, 401)
+
+            status, headers, body = self.request_handler(
+                handler,
+                "/api/login",
+                method="POST",
+                form={"username": "admin", "password": "wrong"},
+                headers=request_headers,
+                client_ip="192.0.2.10",
+            )
+            self.assertEqual(status, 429)
+            self.assertGreaterEqual(int(headers["Retry-After"]), 1)
+            self.assertNotIn("wrong", body.decode("utf-8"))
+
+            different_ip_headers = {
+                **request_headers,
+                "X-Forwarded-For": "192.0.2.10",
+            }
+            status, _, _ = self.request_handler(
+                handler,
+                "/api/login",
+                method="POST",
+                form={"username": "admin", "password": "wrong"},
+                headers=different_ip_headers,
+                client_ip="192.0.2.11",
+            )
+            self.assertEqual(status, 401)
+
+            trusted_handler = make_handler(state_path)
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "MAIL_SYNC_TRUST_PROXY": "1",
+                    "MAIL_SYNC_TRUSTED_PROXY_CIDRS": (
+                        "127.0.0.0/8,198.51.100.0/24"
+                    ),
+                },
+            ):
+                for attempt in range(5):
+                    status, _, _ = self.request_handler(
+                        trusted_handler,
+                        "/api/login",
+                        method="POST",
+                        form={"username": "admin", "password": "wrong"},
+                        headers={
+                            **request_headers,
+                            "X-Forwarded-For": (
+                                "203.0.113.200, 198.51.100.20"
+                            ),
+                        },
+                        client_ip="127.0.0.1",
+                    )
+                    self.assertEqual(status, 429 if attempt == 4 else 401)
+                status, _, _ = self.request_handler(
+                    trusted_handler,
+                    "/api/login",
+                    method="POST",
+                    form={"username": "admin", "password": "wrong"},
+                    headers={
+                        **request_headers,
+                        "X-Forwarded-For": "203.0.113.200, 198.51.100.21",
+                    },
+                    client_ip="127.0.0.1",
+                )
+                self.assertEqual(status, 429)
+                status, _, _ = self.request_handler(
+                    trusted_handler,
+                    "/api/login",
+                    method="POST",
+                    form={"username": "admin", "password": "wrong"},
+                    headers={
+                        **request_headers,
+                        "X-Forwarded-For": "203.0.113.201, 198.51.100.21",
+                    },
+                    client_ip="127.0.0.1",
+                )
+                self.assertEqual(status, 401)
+
+            untrusted_peer_handler = make_handler(state_path)
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "MAIL_SYNC_TRUST_PROXY": "1",
+                    "MAIL_SYNC_TRUSTED_PROXY_CIDRS": "127.0.0.0/8,::1/128",
+                },
+            ):
+                for attempt in range(5):
+                    status, _, _ = self.request_handler(
+                        untrusted_peer_handler,
+                        "/api/login",
+                        method="POST",
+                        form={"username": "admin", "password": "wrong"},
+                        headers={
+                            **request_headers,
+                            "X-Forwarded-For": f"203.0.113.{attempt + 1}",
+                        },
+                        client_ip="192.0.2.30",
+                    )
+                    self.assertEqual(status, 429 if attempt == 4 else 401)
+
+            for _ in range(4):
+                status, _, _ = self.request_handler(
+                    handler,
+                    "/api/login",
+                    method="POST",
+                    form={"username": "admin", "password": "wrong"},
+                    headers=request_headers,
+                    client_ip="192.0.2.12",
+                )
+                self.assertEqual(status, 401)
+            status, _, _ = self.request_handler(
+                handler,
+                "/api/login",
+                method="POST",
+                form={
+                    "username": "admin",
+                    "password": "test-admin-password",
+                },
+                headers=request_headers,
+                client_ip="192.0.2.12",
+            )
+            self.assertEqual(status, 200)
+            status, _, _ = self.request_handler(
+                handler,
+                "/api/login",
+                method="POST",
+                form={"username": "admin", "password": "wrong"},
+                headers=request_headers,
+                client_ip="192.0.2.12",
+            )
+            self.assertEqual(status, 401)
 
     def test_static_shell_session_and_api_pages(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -908,7 +1345,7 @@ class WebConsoleTests(unittest.TestCase):
                 self.assertIn("IMAP.AccessAsUser.All", query["scope"][0])
 
                 with mock.patch("web.app.post_form_json", side_effect=microsoft_response):
-                    status, _, body = request(
+                    status, callback_headers, body = request(
                         f"/outlook/callback?code=auth-code&state={query['state'][0]}",
                         cookie=False,
                     )
@@ -916,6 +1353,16 @@ class WebConsoleTests(unittest.TestCase):
                 page = body.decode("utf-8")
                 self.assertIn("mail-sync-outlook-login", page)
                 self.assertIn("callback@outlook.com", page)
+                nonce = page.split('<script nonce="', 1)[1].split('"', 1)[0]
+                self.assertTrue(nonce)
+                self.assertIn(
+                    f"script-src 'self' 'nonce-{nonce}'",
+                    callback_headers["Content-Security-Policy"],
+                )
+                self.assertNotIn(
+                    "script-src 'self' 'unsafe-inline'",
+                    callback_headers["Content-Security-Policy"],
+                )
                 self.assertEqual(len(oauth_calls), 1)
 
                 mailbox = db.execute(
@@ -1947,7 +2394,10 @@ class WebConsoleTests(unittest.TestCase):
                 self.assertIn("mailboxServiceText", mail_view)
                 self.assertIn("Outlook 邮箱", mail_view)
                 self.assertIn("OAuth Client ID", outlook_panel)
-                self.assertIn("测试验证", outlook_panel)
+                self.assertIn(
+                    '<el-button :loading="testing" @click="testConnection">测试</el-button>',
+                    outlook_panel,
+                )
                 self.assertIn("mailApi.testConnection", outlook_panel)
                 self.assertIn('auth_provider: "outlook"', outlook_panel)
                 self.assertIn('mailbox_protocol_tab: "imap"', outlook_panel)

@@ -15,6 +15,7 @@ import imaplib
 import json
 import os
 import queue
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -46,6 +47,7 @@ from config.validation import (
 )
 from common.errors import SyncError
 from log.events import emit_json
+from log.rotation import SizeRotatingLog
 from connection import connect, ensure_source_connection, safe_logout
 from domain.message import (
     SourceMessage,
@@ -138,7 +140,12 @@ from sync.schedule import build_source_schedule, refresh_source_schedule
 from sync.settings import DEFAULT_SYNC_INTERVAL_SECONDS
 
 
-RUN_CHILD_STOP_TIMEOUT_SECONDS = 8.0
+RUN_CHILD_STOP_TIMEOUT_SECONDS = 20.0
+RUN_LOG_PUMP_STOP_TIMEOUT_SECONDS = 4.0
+DEFAULT_RUN_LOG_MAX_BYTES = 20 * 1024 * 1024
+DEFAULT_RUN_LOG_BACKUP_COUNT = 10
+DEFAULT_WATCH_HEARTBEAT_INTERVAL_SECONDS = 30
+WATCH_HEARTBEAT_FILENAME = "watch.heartbeat"
 MONITOR_UNCHANGED_FULL_SCAN_SKIP_SECONDS = int(
     os.environ.get("MONITOR_UNCHANGED_FULL_SCAN_SKIP_SECONDS", "600")
 )
@@ -688,6 +695,12 @@ def command_watch(
     poll_interval: float,
     max_cycles: Optional[int],
 ) -> int:
+    heartbeat_path, heartbeat_interval = _watch_heartbeat_settings(state_path)
+    next_heartbeat_at = _refresh_watch_heartbeat(
+        heartbeat_path,
+        heartbeat_interval,
+        None,
+    )
     rules = _watch_source_rules(config, source_email)
 
     schedule = build_source_schedule(rules, interval) if rules else []
@@ -702,6 +715,11 @@ def command_watch(
     pending_changes: Dict[Tuple[str, str], dict] = {}
     try:
         while True:
+            next_heartbeat_at = _refresh_watch_heartbeat(
+                heartbeat_path,
+                heartbeat_interval,
+                next_heartbeat_at,
+            )
             (
                 active_config,
                 active_profiles,
@@ -738,6 +756,11 @@ def command_watch(
                     _enqueue_pending_change(pending_changes, change)
             except queue.Empty:
                 pass
+            next_heartbeat_at = _refresh_watch_heartbeat(
+                heartbeat_path,
+                heartbeat_interval,
+                next_heartbeat_at,
+            )
 
             change = _pop_ready_pending_change(
                 pending_changes,
@@ -967,6 +990,43 @@ def command_watch(
                 break
         for record in monitor_records.values():
             record["thread"].join(timeout=2)
+
+
+def _watch_heartbeat_settings(state_path: Path) -> tuple[Path, int]:
+    configured_path = os.environ.get("MAIL_SYNC_HEARTBEAT_PATH", "").strip()
+    heartbeat_path = (
+        Path(configured_path).expanduser()
+        if configured_path
+        else state_path.with_name(WATCH_HEARTBEAT_FILENAME)
+    )
+    if not heartbeat_path.is_absolute():
+        heartbeat_path = heartbeat_path.resolve()
+    interval = _run_log_environment_integer(
+        "MAIL_SYNC_HEARTBEAT_INTERVAL_SECONDS",
+        DEFAULT_WATCH_HEARTBEAT_INTERVAL_SECONDS,
+        minimum=1,
+    )
+    return heartbeat_path, interval
+
+
+def _write_watch_heartbeat(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(now_iso() + "\n", encoding="utf-8")
+
+
+def _refresh_watch_heartbeat(
+    path: Path,
+    interval_seconds: int,
+    next_write_at: Optional[float],
+) -> float:
+    now = time.monotonic()
+    if next_write_at is not None and now < next_write_at:
+        return next_write_at
+    try:
+        _write_watch_heartbeat(path)
+    except OSError as exc:
+        raise SyncError(f"Unable to update watch heartbeat: {exc}") from exc
+    return now + interval_seconds
 
 
 def _enqueue_pending_change(
@@ -1358,6 +1418,7 @@ def command_run(
     log_dir: Optional[str],
 ) -> int:
     log_root = _run_log_dir(state_path, log_dir)
+    log_max_bytes, log_backup_count = _run_log_rotation_settings()
     web_log_path = log_root / "web.log"
     sync_log_path = log_root / "sync.log"
     launcher = Path(__file__).resolve().parents[1] / "mail_sync.py"
@@ -1391,23 +1452,62 @@ def command_run(
     if limit is not None:
         sync_command.extend(["--limit", str(limit)])
 
-    web_log = web_log_path.open("a", encoding="utf-8", buffering=1)
-    sync_log = sync_log_path.open("a", encoding="utf-8", buffering=1)
+    stop_requested = threading.Event()
+    previous_sigterm_handler: object = signal.SIG_DFL
+    sigterm_handler_installed = False
+    if threading.current_thread() is threading.main_thread():
+        previous_sigterm_handler = signal.getsignal(signal.SIGTERM)
+
+        def request_stop(_signum, _frame) -> None:
+            stop_requested.set()
+
+        signal.signal(signal.SIGTERM, request_stop)
+        sigterm_handler_installed = True
+
+    web_log: Optional[SizeRotatingLog] = None
+    sync_log: Optional[SizeRotatingLog] = None
     processes: dict[str, subprocess.Popen] = {}
+    process_streams: dict[str, object] = {}
+    log_pumps: dict[str, threading.Thread] = {}
+    log_pump_errors: dict[str, BaseException] = {}
     try:
+        web_log = SizeRotatingLog(
+            web_log_path,
+            max_bytes=log_max_bytes,
+            backup_count=log_backup_count,
+        )
+        sync_log = SizeRotatingLog(
+            sync_log_path,
+            max_bytes=log_max_bytes,
+            backup_count=log_backup_count,
+        )
         _write_run_log_header(web_log, "web")
         _write_run_log_header(sync_log, "sync")
         processes["web"] = subprocess.Popen(
             web_command,
-            stdout=web_log,
+            stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             cwd=str(launcher.parent.parent),
         )
+        process_streams["web"] = _run_process_stdout(processes["web"], "web")
+        log_pumps["web"] = _start_run_log_pump(
+            "web",
+            process_streams["web"],
+            web_log,
+            log_pump_errors,
+        )
         processes["sync"] = subprocess.Popen(
             sync_command,
-            stdout=sync_log,
+            stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             cwd=str(launcher.parent.parent),
+        )
+        process_streams["sync"] = _run_process_stdout(processes["sync"], "sync")
+        log_pumps["sync"] = _start_run_log_pump(
+            "sync",
+            process_streams["sync"],
+            sync_log,
+            log_pump_errors,
         )
         emit_json(
             {
@@ -1419,6 +1519,25 @@ def command_run(
             }
         )
         while True:
+            if stop_requested.is_set():
+                emit_json(
+                    {
+                        "event": "combined_runner_stopping",
+                        "time": now_iso(),
+                        "reason": "sigterm",
+                    }
+                )
+                return 0
+            for name, error in list(log_pump_errors.items()):
+                emit_json(
+                    {
+                        "event": "combined_runner_log_failed",
+                        "service": name,
+                        "error": str(error),
+                    },
+                    error=True,
+                )
+                return 1
             for name, process in processes.items():
                 return_code = process.poll()
                 if return_code is None:
@@ -1431,22 +1550,114 @@ def command_run(
                     },
                     error=return_code != 0,
                 )
-                _stop_run_processes(
-                    {
-                        other_name: other_process
-                        for other_name, other_process in processes.items()
-                        if other_name != name
-                    }
-                )
                 return return_code if return_code != 0 else 1
-            time.sleep(1)
+            stop_requested.wait(1)
     except KeyboardInterrupt:
         emit_json({"event": "combined_runner_stopping", "time": now_iso()})
-        _stop_run_processes(processes)
         return 0
     finally:
-        web_log.close()
-        sync_log.close()
+        _stop_run_processes(processes)
+        _join_run_log_pumps(log_pumps, process_streams)
+        if web_log is not None:
+            web_log.close()
+        if sync_log is not None:
+            sync_log.close()
+        if sigterm_handler_installed:
+            signal.signal(signal.SIGTERM, previous_sigterm_handler)
+
+
+def _run_log_rotation_settings() -> tuple[int, int]:
+    return (
+        _run_log_environment_integer(
+            "MAIL_SYNC_LOG_MAX_BYTES",
+            DEFAULT_RUN_LOG_MAX_BYTES,
+            minimum=1,
+        ),
+        _run_log_environment_integer(
+            "MAIL_SYNC_LOG_BACKUP_COUNT",
+            DEFAULT_RUN_LOG_BACKUP_COUNT,
+            minimum=0,
+        ),
+    )
+
+
+def _run_log_environment_integer(name: str, default: int, *, minimum: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise SyncError(f"{name} must be an integer") from exc
+    if value < minimum:
+        comparator = "positive" if minimum == 1 else "non-negative"
+        raise SyncError(f"{name} must be {comparator}")
+    return value
+
+
+def _run_process_stdout(process: subprocess.Popen, service: str):
+    stream = process.stdout
+    if stream is None:
+        raise SyncError(f"Unable to capture {service} process output")
+    return stream
+
+
+def _start_run_log_pump(
+    service: str,
+    stream,
+    destination: SizeRotatingLog,
+    errors: dict[str, BaseException],
+) -> threading.Thread:
+    def pump() -> None:
+        try:
+            read = getattr(stream, "read1", stream.read)
+            while True:
+                chunk = read(64 * 1024)
+                if not chunk:
+                    return
+                destination.write(chunk)
+                destination.flush()
+        except BaseException as exc:
+            errors[service] = exc
+        finally:
+            try:
+                stream.close()
+            except (OSError, ValueError):
+                pass
+
+    thread = threading.Thread(
+        target=pump,
+        name=f"mail-sync-{service}-log",
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
+def _join_run_log_pumps(
+    pumps: dict[str, threading.Thread],
+    streams: dict[str, object],
+) -> None:
+    deadline = time.monotonic() + RUN_LOG_PUMP_STOP_TIMEOUT_SECONDS
+    for name, thread in pumps.items():
+        remaining = max(0.0, deadline - time.monotonic())
+        thread.join(timeout=remaining)
+        if not thread.is_alive():
+            continue
+        stream = streams.get(name)
+        if stream is not None:
+            try:
+                stream.close()
+            except (OSError, ValueError):
+                pass
+        thread.join(timeout=0.1)
+    for stream in streams.values():
+        if getattr(stream, "closed", False):
+            continue
+        try:
+            stream.close()
+        except (OSError, ValueError):
+            pass
 
 
 def _run_log_dir(state_path: Path, log_dir: Optional[str]) -> Path:
@@ -1483,12 +1694,18 @@ def _write_run_log_header(handle, service: str) -> None:
         )
         + "\n"
     )
+    handle.flush()
 
 
 def _stop_run_processes(processes: dict[str, subprocess.Popen]) -> None:
     for process in processes.values():
         if process.poll() is None:
-            process.terminate()
+            try:
+                process.send_signal(signal.SIGINT)
+            except AttributeError:
+                process.terminate()
+            except OSError:
+                pass
     deadline = time.monotonic() + RUN_CHILD_STOP_TIMEOUT_SECONDS
     for process in processes.values():
         remaining = max(0.0, deadline - time.monotonic())

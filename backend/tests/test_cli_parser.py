@@ -1,5 +1,8 @@
+import io
 import json
 import queue
+import signal
+import stat
 import tempfile
 import time
 import unittest
@@ -449,14 +452,20 @@ class RealtimeMonitorRefreshTests(unittest.TestCase):
 class CombinedRunnerTests(unittest.TestCase):
     def test_run_starts_web_and_sync_with_separate_logs(self):
         class FakeProcess:
-            def __init__(self, pid, return_code):
+            def __init__(self, pid, return_code, output):
                 self.pid = pid
                 self.return_code = return_code
+                self.stdout = io.BytesIO(output)
                 self.terminated = False
                 self.killed = False
+                self.signals = []
 
             def poll(self):
                 return self.return_code
+
+            def send_signal(self, signum):
+                self.signals.append(signum)
+                self.return_code = 0
 
             def terminate(self):
                 self.terminated = True
@@ -473,8 +482,8 @@ class CombinedRunnerTests(unittest.TestCase):
             state_path = Path(directory) / "state.sqlite3"
             log_dir = Path(directory) / "logs"
             processes = [
-                FakeProcess(101, None),
-                FakeProcess(102, 3),
+                FakeProcess(101, None, b"web output\n"),
+                FakeProcess(102, 3, b"sync output\n"),
             ]
             commands = []
 
@@ -497,9 +506,11 @@ class CombinedRunnerTests(unittest.TestCase):
                 )
 
             self.assertEqual(result, 3)
-            self.assertTrue(processes[0].terminated)
+            self.assertEqual(processes[0].signals, [signal.SIGINT])
             self.assertIn("serve", commands[0][0])
             self.assertIn("watch", commands[1][0])
+            self.assertIs(commands[0][1]["stdout"], mail_sync.subprocess.PIPE)
+            self.assertIs(commands[1][1]["stdout"], mail_sync.subprocess.PIPE)
             self.assertIn("--oldest-first", commands[1][0])
             self.assertIn("--source", commands[1][0])
             self.assertIn("source@example.com", commands[1][0])
@@ -507,6 +518,323 @@ class CombinedRunnerTests(unittest.TestCase):
             self.assertTrue((log_dir / "sync.log").exists())
             self.assertIn("web", (log_dir / "web.log").read_text(encoding="utf-8"))
             self.assertIn("sync", (log_dir / "sync.log").read_text(encoding="utf-8"))
+            self.assertIn(
+                "web output",
+                (log_dir / "web.log").read_text(encoding="utf-8"),
+            )
+            self.assertIn(
+                "sync output",
+                (log_dir / "sync.log").read_text(encoding="utf-8"),
+            )
+
+    def test_size_rotating_log_retains_numbered_backups(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "sync.log"
+            log = mail_sync.SizeRotatingLog(
+                path,
+                max_bytes=10,
+                backup_count=2,
+            )
+            try:
+                log.write(b"12345")
+                log.write(b"67890")
+                log.write(b"abc")
+                log.write(b"defghijk")
+            finally:
+                log.close()
+
+            self.assertEqual(path.read_bytes(), b"defghijk")
+            self.assertEqual((Path(str(path) + ".1")).read_bytes(), b"abc")
+            self.assertEqual((Path(str(path) + ".2")).read_bytes(), b"1234567890")
+            self.assertEqual(stat.S_IMODE(path.parent.stat().st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            self.assertEqual(
+                stat.S_IMODE(Path(str(path) + ".1").stat().st_mode),
+                0o600,
+            )
+            self.assertEqual(
+                stat.S_IMODE(Path(str(path) + ".2").stat().st_mode),
+                0o600,
+            )
+
+    def test_size_rotating_log_tolerates_permission_chmod_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "logs" / "sync.log"
+            with mock.patch.object(
+                Path,
+                "chmod",
+                side_effect=PermissionError("chmod denied"),
+            ):
+                log = mail_sync.SizeRotatingLog(
+                    path,
+                    max_bytes=10,
+                    backup_count=1,
+                )
+                try:
+                    log.write(b"one\n")
+                    log.write(b"two-two\n")
+                finally:
+                    log.close()
+
+            self.assertTrue(path.exists())
+            self.assertTrue(Path(str(path) + ".1").exists())
+
+    def test_run_log_rotation_settings_use_environment(self):
+        with mock.patch.dict(mail_sync.os.environ, {}, clear=True):
+            self.assertEqual(
+                mail_sync._run_log_rotation_settings(),
+                (
+                    20 * 1024 * 1024,
+                    10,
+                ),
+            )
+
+        with mock.patch.dict(
+            mail_sync.os.environ,
+            {
+                "MAIL_SYNC_LOG_MAX_BYTES": "4096",
+                "MAIL_SYNC_LOG_BACKUP_COUNT": "4",
+            },
+            clear=True,
+        ):
+            self.assertEqual(mail_sync._run_log_rotation_settings(), (4096, 4))
+
+        with mock.patch.dict(
+            mail_sync.os.environ,
+            {"MAIL_SYNC_LOG_MAX_BYTES": "0"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(mail_sync.SyncError, "must be positive"):
+                mail_sync._run_log_rotation_settings()
+
+    def test_watch_heartbeat_settings_default_and_environment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_path = root / "state.sqlite3"
+            with mock.patch.dict(mail_sync.os.environ, {}, clear=True):
+                path, interval = mail_sync._watch_heartbeat_settings(state_path)
+            self.assertEqual(path, root / "watch.heartbeat")
+            self.assertEqual(interval, 30)
+
+            custom_path = root / "runtime" / "watch.alive"
+            with mock.patch.dict(
+                mail_sync.os.environ,
+                {
+                    "MAIL_SYNC_HEARTBEAT_PATH": str(custom_path),
+                    "MAIL_SYNC_HEARTBEAT_INTERVAL_SECONDS": "7",
+                },
+                clear=True,
+            ):
+                path, interval = mail_sync._watch_heartbeat_settings(state_path)
+            self.assertEqual(path, custom_path)
+            self.assertEqual(interval, 7)
+
+    def test_watch_heartbeat_refreshes_on_schedule_and_propagates_failure(self):
+        path = Path("/tmp/watch.heartbeat")
+        with (
+            mock.patch.object(
+                mail_sync.time,
+                "monotonic",
+                side_effect=[100.0, 120.0, 131.0],
+            ),
+            mock.patch.object(mail_sync, "_write_watch_heartbeat") as write,
+        ):
+            next_write = mail_sync._refresh_watch_heartbeat(path, 30, None)
+            self.assertEqual(next_write, 130.0)
+            self.assertEqual(
+                mail_sync._refresh_watch_heartbeat(path, 30, next_write),
+                130.0,
+            )
+            self.assertEqual(
+                mail_sync._refresh_watch_heartbeat(path, 30, next_write),
+                161.0,
+            )
+        self.assertEqual(write.call_count, 2)
+
+        with (
+            mock.patch.object(mail_sync.time, "monotonic", return_value=200.0),
+            mock.patch.object(
+                mail_sync,
+                "_write_watch_heartbeat",
+                side_effect=OSError("disk unavailable"),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                mail_sync.SyncError,
+                "Unable to update watch heartbeat",
+            ):
+                mail_sync._refresh_watch_heartbeat(path, 30, None)
+
+    def test_run_handles_sigterm_and_restores_previous_handler(self):
+        class FakeProcess:
+            def __init__(self, pid):
+                self.pid = pid
+                self.return_code = None
+                self.stdout = io.BytesIO()
+                self.signals = []
+
+            def poll(self):
+                return self.return_code
+
+            def send_signal(self, signum):
+                self.signals.append(signum)
+                self.return_code = 0
+
+            def kill(self):
+                self.return_code = -9
+
+            def wait(self, timeout=None):
+                return self.return_code
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.sqlite3"
+            processes = [FakeProcess(201), FakeProcess(202)]
+            installed_handlers = []
+            previous_handler = object()
+            created = []
+
+            def fake_signal(_signum, handler):
+                installed_handlers.append(handler)
+
+            def fake_popen(_command, **_kwargs):
+                process = processes[len(created)]
+                created.append(process)
+                if len(created) == 2:
+                    installed_handlers[0](signal.SIGTERM, None)
+                return process
+
+            with (
+                mock.patch.object(
+                    mail_sync.signal,
+                    "getsignal",
+                    return_value=previous_handler,
+                ),
+                mock.patch.object(
+                    mail_sync.signal,
+                    "signal",
+                    side_effect=fake_signal,
+                ),
+                mock.patch.object(
+                    mail_sync.subprocess,
+                    "Popen",
+                    side_effect=fake_popen,
+                ),
+                mock.patch.object(mail_sync, "emit_json") as emit,
+            ):
+                result = mail_sync.command_run(
+                    state_path,
+                    "127.0.0.1",
+                    8080,
+                    None,
+                    None,
+                    None,
+                    True,
+                    15,
+                    0.0,
+                    str(Path(directory) / "logs"),
+                )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(processes[0].signals, [signal.SIGINT])
+        self.assertEqual(processes[1].signals, [signal.SIGINT])
+        self.assertIs(installed_handlers[-1], previous_handler)
+        self.assertTrue(
+            any(
+                call.args[0].get("reason") == "sigterm"
+                for call in emit.call_args_list
+            )
+        )
+
+    def test_run_preserves_keyboard_interrupt_shutdown(self):
+        class FakeProcess:
+            def __init__(self, pid, interrupt=False):
+                self.pid = pid
+                self.interrupt = interrupt
+                self.return_code = None
+                self.stdout = io.BytesIO()
+                self.signals = []
+
+            def poll(self):
+                if self.interrupt:
+                    self.interrupt = False
+                    raise KeyboardInterrupt
+                return self.return_code
+
+            def send_signal(self, signum):
+                self.signals.append(signum)
+                self.return_code = 0
+
+            def kill(self):
+                self.return_code = -9
+
+            def wait(self, timeout=None):
+                return self.return_code
+
+        processes = [FakeProcess(301, interrupt=True), FakeProcess(302)]
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                mock.patch.object(
+                    mail_sync.subprocess,
+                    "Popen",
+                    side_effect=processes,
+                ),
+                mock.patch.object(mail_sync, "emit_json"),
+            ):
+                result = mail_sync.command_run(
+                    Path(directory) / "state.sqlite3",
+                    "127.0.0.1",
+                    8080,
+                    None,
+                    None,
+                    None,
+                    True,
+                    15,
+                    0.0,
+                    str(Path(directory) / "logs"),
+                )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(processes[0].signals, [signal.SIGINT])
+        self.assertEqual(processes[1].signals, [signal.SIGINT])
+
+    def test_run_stop_kills_child_after_graceful_timeout(self):
+        class StubbornProcess:
+            def __init__(self):
+                self.return_code = None
+                self.signals = []
+                self.wait_timeouts = []
+                self.killed = False
+
+            def poll(self):
+                return self.return_code
+
+            def send_signal(self, signum):
+                self.signals.append(signum)
+
+            def wait(self, timeout=None):
+                self.wait_timeouts.append(timeout)
+                if not self.killed:
+                    raise mail_sync.subprocess.TimeoutExpired("child", timeout)
+                return self.return_code
+
+            def kill(self):
+                self.killed = True
+                self.return_code = -9
+
+        process = StubbornProcess()
+        with mock.patch.object(
+            mail_sync.time,
+            "monotonic",
+            side_effect=[100.0, 100.0],
+        ):
+            mail_sync._stop_run_processes({"sync": process})
+
+        self.assertEqual(process.signals, [signal.SIGINT])
+        self.assertEqual(
+            process.wait_timeouts,
+            [mail_sync.RUN_CHILD_STOP_TIMEOUT_SECONDS],
+        )
+        self.assertTrue(process.killed)
 
 
 class WatchStartupTests(unittest.TestCase):

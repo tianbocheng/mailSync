@@ -4,12 +4,17 @@ import base64
 import binascii
 import hashlib
 import html
+import ipaddress
 import json
 import imaplib
+import math
+import os
 import poplib
 import secrets
 import sqlite3
+import threading
 import time
+from collections import deque
 from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -75,6 +80,242 @@ STATIC_TYPES = {
     ".woff": "font/woff",
     ".woff2": "font/woff2",
 }
+HEARTBEAT_MAX_AGE_SECONDS = 600
+HEARTBEAT_MAX_AGE_ENV = "MAIL_SYNC_HEARTBEAT_MAX_AGE_SECONDS"
+HEARTBEAT_FILENAME = "watch.heartbeat"
+TRUSTED_PROXY_CIDRS_ENV = "MAIL_SYNC_TRUSTED_PROXY_CIDRS"
+DEFAULT_TRUSTED_PROXY_CIDRS = "127.0.0.0/8,::1/128"
+LOGIN_FAILURE_LIMIT = 5
+LOGIN_FAILURE_WINDOW_SECONDS = 5 * 60
+LOGIN_FAILURE_CACHE_SIZE = 4096
+CONTENT_SECURITY_POLICY = (
+    "default-src 'self'; "
+    "base-uri 'self'; "
+    "object-src 'none'; "
+    "frame-ancestors 'none'; "
+    "script-src 'self'; "
+    "style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data:; "
+    "font-src 'self' data:; "
+    "connect-src 'self'; "
+    "form-action 'self'"
+)
+
+
+def _content_security_policy(script_nonce: str | None = None) -> str:
+    if not script_nonce:
+        return CONTENT_SECURITY_POLICY
+    return CONTENT_SECURITY_POLICY.replace(
+        "script-src 'self';",
+        f"script-src 'self' 'nonce-{script_nonce}';",
+    )
+
+
+def _environment_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _heartbeat_max_age_seconds() -> int:
+    raw_value = os.environ.get(HEARTBEAT_MAX_AGE_ENV, "").strip()
+    if not raw_value:
+        return HEARTBEAT_MAX_AGE_SECONDS
+    try:
+        value = int(raw_value)
+    except ValueError:
+        return HEARTBEAT_MAX_AGE_SECONDS
+    return value if value > 0 else HEARTBEAT_MAX_AGE_SECONDS
+
+
+def _heartbeat_path(state_path: Path) -> Path:
+    configured = os.environ.get("MAIL_SYNC_HEARTBEAT_PATH", "").strip()
+    path = (
+        Path(configured).expanduser()
+        if configured
+        else state_path.with_name(HEARTBEAT_FILENAME)
+    )
+    return path if path.is_absolute() else path.resolve()
+
+
+def _liveness_snapshot(state_path: Path) -> tuple[dict[str, Any], int]:
+    checks: dict[str, dict[str, Any]] = {
+        "web": {"status": "ok"},
+    }
+    healthy = True
+
+    try:
+        database_uri = f"{state_path.resolve().as_uri()}?mode=ro"
+        with closing(
+            sqlite3.connect(
+                database_uri,
+                uri=True,
+                timeout=5,
+            )
+        ) as db:
+            db.execute("PRAGMA query_only=ON")
+            db.execute("PRAGMA busy_timeout=5000")
+            db.execute("SELECT 1").fetchone()
+        checks["database"] = {"status": "ok"}
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        healthy = False
+        checks["database"] = {"status": "error"}
+
+    max_age_seconds = _heartbeat_max_age_seconds()
+    try:
+        modified_at = _heartbeat_path(state_path).stat().st_mtime
+        age_seconds = max(0.0, time.time() - modified_at)
+        heartbeat_status = "ok" if age_seconds <= max_age_seconds else "stale"
+        checks["heartbeat"] = {
+            "status": heartbeat_status,
+            "age_seconds": round(age_seconds, 1),
+            "max_age_seconds": max_age_seconds,
+        }
+        if heartbeat_status != "ok":
+            healthy = False
+    except FileNotFoundError:
+        healthy = False
+        checks["heartbeat"] = {
+            "status": "missing",
+            "max_age_seconds": max_age_seconds,
+        }
+    except OSError:
+        healthy = False
+        checks["heartbeat"] = {
+            "status": "unavailable",
+            "max_age_seconds": max_age_seconds,
+        }
+
+    status = "healthy" if healthy else "unhealthy"
+    return {
+        "status": status,
+        "healthy": healthy,
+        "checks": checks,
+    }, 200 if healthy else 503
+
+
+def _health_snapshot(state_path: Path) -> tuple[dict[str, Any], int]:
+    live_data, _ = _liveness_snapshot(state_path)
+    checks = dict(live_data["checks"])
+    healthy = bool(live_data["healthy"])
+
+    try:
+        database_uri = f"{state_path.resolve().as_uri()}?mode=ro"
+        with closing(
+            sqlite3.connect(
+                database_uri,
+                uri=True,
+                timeout=5,
+            )
+        ) as db:
+            db.execute("PRAGMA query_only=ON")
+            db.execute("PRAGMA busy_timeout=5000")
+            enabled_rules, failed_rules = db.execute(
+                """
+                SELECT COUNT(*),
+                       COALESCE(SUM(
+                           CASE WHEN COALESCE(last_sync_status, '')='ok'
+                                THEN 0 ELSE 1 END
+                       ), 0)
+                FROM source_rules
+                WHERE enabled=1
+                """
+            ).fetchone()
+            pending_count = int(
+                db.execute("SELECT COUNT(*) FROM pending_operations").fetchone()[0]
+            )
+        enabled_rules = int(enabled_rules)
+        failed_rules = int(failed_rules)
+        checks["rules"] = {
+            "status": "ok" if failed_rules == 0 else "error",
+            "enabled": enabled_rules,
+            "failed": failed_rules,
+        }
+        checks["pending"] = {
+            "status": "ok" if pending_count == 0 else "error",
+            "count": pending_count,
+        }
+        if failed_rules or pending_count:
+            healthy = False
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        healthy = False
+        checks["database"] = {"status": "error"}
+        checks["rules"] = {"status": "unavailable"}
+        checks["pending"] = {"status": "unavailable"}
+
+    status = "healthy" if healthy else "unhealthy"
+    return {
+        "status": status,
+        "healthy": healthy,
+        "checks": checks,
+    }, 200 if healthy else 503
+
+
+def _normalized_ip_address(value: str):
+    address = ipaddress.ip_address(value)
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+        return address.ipv4_mapped
+    return address
+
+
+def _trusted_proxy_networks() -> list:
+    raw = os.environ.get(
+        TRUSTED_PROXY_CIDRS_ENV,
+        DEFAULT_TRUSTED_PROXY_CIDRS,
+    )
+    networks = []
+    for value in raw.split(","):
+        value = value.strip()
+        if not value:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(value, strict=False))
+        except ValueError:
+            continue
+    return networks
+
+
+def _is_trusted_proxy(address, networks: list) -> bool:
+    return any(
+        address.version == network.version and address in network
+        for network in networks
+    )
+
+
+def _request_client_ip(client_address: object, forwarded_for: str) -> str:
+    raw_peer = (
+        str(client_address[0])
+        if isinstance(client_address, tuple) and client_address
+        else "unknown"
+    )
+    try:
+        peer = _normalized_ip_address(raw_peer)
+    except ValueError:
+        return raw_peer[:128]
+    if not _environment_flag("MAIL_SYNC_TRUST_PROXY"):
+        return str(peer)
+
+    trusted_networks = _trusted_proxy_networks()
+    if not _is_trusted_proxy(peer, trusted_networks):
+        return str(peer)
+
+    forwarded_addresses = []
+    for value in forwarded_for.split(","):
+        value = value.strip()
+        if not value:
+            continue
+        try:
+            forwarded_addresses.append(_normalized_ip_address(value))
+        except ValueError:
+            return str(peer)
+    for address in reversed(forwarded_addresses):
+        if _is_trusted_proxy(address, trusted_networks):
+            continue
+        return str(address)
+    return str(peer)
 
 
 def create_web_server(
@@ -112,12 +353,23 @@ def serve_web(state_path: Path, host: str, port: int) -> int:
 
 
 def make_handler(state_path: Path) -> type[BaseHTTPRequestHandler]:
+    login_failures: dict[tuple[str, str], deque[float]] = {}
+    login_failures_lock = threading.Lock()
+
     class MailSyncWebHandler(BaseHTTPRequestHandler):
         server_version = "MailSyncWeb/1.0"
 
         def do_GET(self) -> None:
             self._begin_request_log()
             path = urlparse(self.path).path
+            if path == "/api/live":
+                data, status = _liveness_snapshot(state_path)
+                self._send_json(data, status=status)
+                return
+            if path == "/api/health":
+                data, status = _health_snapshot(state_path)
+                self._send_json(data, status=status)
+                return
             if path.startswith("/assets/") or path in {"/favicon.ico"}:
                 self._serve_file(path.lstrip("/"))
                 return
@@ -176,9 +428,17 @@ def make_handler(state_path: Path) -> type[BaseHTTPRequestHandler]:
             username = self._field(fields, "username").strip()
             password = self._field(fields, "password")
             wants_json = path == "/api/login" or self._wants_json()
+            retry_after = self._login_retry_after(username)
+            if retry_after > 0:
+                self._send_login_rate_limited(retry_after)
+                return
             with closing(self._db()) as db:
                 user = authenticate_user(db, username, password)
                 if user is None:
+                    retry_after = self._record_login_failure(username)
+                    if retry_after > 0:
+                        self._send_login_rate_limited(retry_after)
+                        return
                     if wants_json:
                         self._send_json(
                             {
@@ -190,6 +450,7 @@ def make_handler(state_path: Path) -> type[BaseHTTPRequestHandler]:
                         return
                     self._redirect("/login?error=invalid_credentials")
                     return
+                self._clear_login_failures(username)
                 cookie = session.make_session_cookie(db, user["username"])
             if wants_json:
                 self._send_json(
@@ -209,6 +470,77 @@ def make_handler(state_path: Path) -> type[BaseHTTPRequestHandler]:
         def _begin_request_log(self) -> None:
             self._request_started_at = time.monotonic()
             self._request_log_context = {}
+
+        def _login_key(self, username: str) -> tuple[str, str]:
+            client_ip = _request_client_ip(
+                getattr(self, "client_address", None),
+                self.headers.get("X-Forwarded-For", ""),
+            )
+            return client_ip[:128], username.strip().casefold()[:256]
+
+        def _login_retry_after(self, username: str) -> int:
+            now = time.monotonic()
+            key = self._login_key(username)
+            with login_failures_lock:
+                self._prune_login_failures(now)
+                attempts = login_failures.get(key)
+                if attempts is None or len(attempts) < LOGIN_FAILURE_LIMIT:
+                    return 0
+                return max(
+                    1,
+                    math.ceil(
+                        LOGIN_FAILURE_WINDOW_SECONDS - (now - attempts[0])
+                    ),
+                )
+
+        def _record_login_failure(self, username: str) -> int:
+            now = time.monotonic()
+            key = self._login_key(username)
+            cutoff = now - LOGIN_FAILURE_WINDOW_SECONDS
+            with login_failures_lock:
+                self._prune_login_failures(now)
+                attempts = login_failures.setdefault(key, deque())
+                while attempts and attempts[0] <= cutoff:
+                    attempts.popleft()
+                attempts.append(now)
+                if len(attempts) < LOGIN_FAILURE_LIMIT:
+                    return 0
+                return max(
+                    1,
+                    math.ceil(
+                        LOGIN_FAILURE_WINDOW_SECONDS - (now - attempts[0])
+                    ),
+                )
+
+        def _clear_login_failures(self, username: str) -> None:
+            key = self._login_key(username)
+            with login_failures_lock:
+                login_failures.pop(key, None)
+
+        def _prune_login_failures(self, now: float) -> None:
+            cutoff = now - LOGIN_FAILURE_WINDOW_SECONDS
+            for key, attempts in list(login_failures.items()):
+                while attempts and attempts[0] <= cutoff:
+                    attempts.popleft()
+                if not attempts:
+                    login_failures.pop(key, None)
+            if len(login_failures) < LOGIN_FAILURE_CACHE_SIZE:
+                return
+            oldest_key = min(
+                login_failures,
+                key=lambda key: login_failures[key][-1],
+            )
+            login_failures.pop(oldest_key, None)
+
+        def _send_login_rate_limited(self, retry_after: int) -> None:
+            self._send_json(
+                {
+                    "ok": False,
+                    "error": "登录尝试过于频繁，请稍后重试。",
+                },
+                status=429,
+                headers={"Retry-After": str(retry_after)},
+            )
 
         def _fields_log_context(
             self,
@@ -1367,7 +1699,9 @@ def make_handler(state_path: Path) -> type[BaseHTTPRequestHandler]:
                     **result,
                 },
                 ensure_ascii=False,
-            )
+                separators=(",", ":"),
+            ).replace("<", "\\u003c")
+            script_nonce = secrets.token_urlsafe(24)
             title = "Outlook 登录完成" if result.get("ok") else "Outlook 登录失败"
             message = str(result.get("message") or title)
             body = f"""<!doctype html>
@@ -1378,17 +1712,25 @@ def make_handler(state_path: Path) -> type[BaseHTTPRequestHandler]:
   </head>
   <body>
     <p>{html.escape(message)}</p>
-    <script>
+    <script nonce="{script_nonce}">
       const payload = {payload};
       if (window.opener) {{
-        window.opener.postMessage(payload, "*");
+        window.opener.postMessage(payload, window.location.origin);
       }}
       setTimeout(() => window.close(), 600);
     </script>
   </body>
 </html>
 """
-            self._send_html(body.encode("utf-8"), status=status)
+            self._send_html(
+                body.encode("utf-8"),
+                status=status,
+                headers={
+                    "Content-Security-Policy": _content_security_policy(
+                        script_nonce
+                    )
+                },
+            )
 
         def _outlook_auth_from_fields(
             self,
@@ -1902,6 +2244,7 @@ def make_handler(state_path: Path) -> type[BaseHTTPRequestHandler]:
             cookies: Optional[list[str]] = None,
         ) -> None:
             self.send_response(303)
+            self._send_security_headers()
             self.send_header("Location", location)
             for cookie in cookies or []:
                 self.send_header("Set-Cookie", cookie)
@@ -1913,6 +2256,7 @@ def make_handler(state_path: Path) -> type[BaseHTTPRequestHandler]:
             status: int = 200,
             *,
             cookies: Optional[list[str]] = None,
+            headers: Optional[dict[str, str]] = None,
         ) -> None:
             body = json.dumps(
                 self._json_ready(data),
@@ -1924,6 +2268,7 @@ def make_handler(state_path: Path) -> type[BaseHTTPRequestHandler]:
                 "application/json; charset=utf-8",
                 status=status,
                 cookies=cookies,
+                headers=headers,
             )
             self._log_json_response(data, status)
 
@@ -1974,8 +2319,19 @@ def make_handler(state_path: Path) -> type[BaseHTTPRequestHandler]:
                 }
             return value
 
-        def _send_html(self, body: bytes, status: int = 200) -> None:
-            self._send_bytes(body, "text/html; charset=utf-8", status=status)
+        def _send_html(
+            self,
+            body: bytes,
+            status: int = 200,
+            *,
+            headers: Optional[dict[str, str]] = None,
+        ) -> None:
+            self._send_bytes(
+                body,
+                "text/html; charset=utf-8",
+                status=status,
+                headers=headers,
+            )
 
         def _send_bytes(
             self,
@@ -1984,14 +2340,32 @@ def make_handler(state_path: Path) -> type[BaseHTTPRequestHandler]:
             *,
             status: int = 200,
             cookies: Optional[list[str]] = None,
+            headers: Optional[dict[str, str]] = None,
         ) -> None:
             self.send_response(status)
+            response_headers = dict(headers or {})
+            content_security_policy = response_headers.pop(
+                "Content-Security-Policy",
+                CONTENT_SECURITY_POLICY,
+            )
+            self._send_security_headers(content_security_policy)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            for key, value in response_headers.items():
+                self.send_header(key, value)
             for cookie in cookies or []:
                 self.send_header("Set-Cookie", cookie)
             self.end_headers()
             self.wfile.write(body)
+
+        def _send_security_headers(
+            self,
+            content_security_policy: str = CONTENT_SECURITY_POLICY,
+        ) -> None:
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Referrer-Policy", "same-origin")
+            self.send_header("Content-Security-Policy", content_security_policy)
 
     return MailSyncWebHandler

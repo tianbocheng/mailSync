@@ -36,6 +36,13 @@ def init_db(path: Path) -> sqlite3.Connection:
             f"State database schema version {current_schema_version} is newer "
             f"than this synchronizer supports ({DB_SCHEMA_VERSION})"
         )
+    # Configuration includes small external-data migrations (for example an
+    # OAuth token file imported after the schema itself is current), so keep
+    # those checks while skipping the expensive state-table backfills.
+    if current_schema_version == DB_SCHEMA_VERSION:
+        ensure_config_tables(connection)
+        connection.commit()
+        return connection
     connection.executescript(
         """
         CREATE TABLE IF NOT EXISTS messages (

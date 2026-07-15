@@ -4,6 +4,7 @@ import base64
 import hmac
 import hashlib
 import json
+import os
 import secrets
 import sqlite3
 import time
@@ -21,7 +22,7 @@ def make_session_cookie(db: sqlite3.Connection, username: str) -> str:
     signature = _sign(get_session_secret(db), payload)
     return (
         f"{SESSION_COOKIE}={payload}.{signature}; Path=/; HttpOnly; "
-        f"SameSite=Lax; Max-Age={SESSION_TTL_SECONDS}"
+        f"SameSite=Lax; Max-Age={SESSION_TTL_SECONDS}{_secure_suffix()}"
     )
 
 
@@ -29,7 +30,13 @@ def clear_session_cookie() -> str:
     return (
         f"{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; "
         "Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT"
+        f"{_secure_suffix()}"
     )
+
+
+def _secure_suffix() -> str:
+    enabled = os.environ.get("MAIL_SYNC_COOKIE_SECURE", "").strip().lower()
+    return "; Secure" if enabled in {"1", "true", "yes", "on"} else ""
 
 
 def current_username(

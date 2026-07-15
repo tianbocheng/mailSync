@@ -75,6 +75,30 @@ class LoginUserSchemaTests(unittest.TestCase):
 
         hash_password.assert_not_called()
 
+    def test_init_db_uses_fast_path_for_current_schema(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.sqlite3"
+            db = mail_sync.init_db(state_path)
+            db.close()
+
+            with (
+                mock.patch("storage.state.ensure_config_tables") as ensure_tables,
+                mock.patch(
+                    "storage.state._backfill_log_target_folders"
+                ) as backfill_folders,
+            ):
+                db = mail_sync.init_db(state_path)
+                try:
+                    schema_version = db.execute(
+                        "PRAGMA user_version"
+                    ).fetchone()[0]
+                finally:
+                    db.close()
+
+        self.assertEqual(schema_version, mail_sync.DB_SCHEMA_VERSION)
+        ensure_tables.assert_called_once()
+        backfill_folders.assert_not_called()
+
 
 class QuarantineTests(unittest.TestCase):
     def _insert_pending_operation(

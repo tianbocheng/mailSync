@@ -156,13 +156,49 @@ Build and start:
 docker compose -f deploy/compose.yaml up -d --build
 ```
 
-查看日志：
+查看应用日志：
 
-View logs:
+View application logs:
 
 ```bash
-docker compose -f deploy/compose.yaml logs -f mail-sync
+tail -f logs/web.log
+tail -f logs/sync.log
 ```
+
+推荐使用带一致性备份、健康验证和失败回滚的重部署脚本：
+
+For deployments, prefer the script with a consistent SQLite backup, health
+verification, and automatic image rollback:
+
+```bash
+./deploy/redeploy.sh
+```
+
+部署备份保存在 `data/backups/`，默认保留最近 10 份。服务提供无需登录且不泄露
+邮箱详情的健康检查接口：
+
+Deployment backups are stored in `data/backups/` with the latest 10 retained
+by default. The service exposes unauthenticated liveness and business-health
+endpoints without mailbox details:
+
+```bash
+curl http://127.0.0.1:24000/api/live
+curl http://127.0.0.1:24000/api/health
+```
+
+`/api/live` 只检查 Web、SQLite 和同步进程心跳，供 Docker 与部署验证使用；
+`/api/health` 还会检查规则失败和待恢复操作，适合监控告警。
+
+常用运行参数：
+
+- `MAIL_SYNC_COOKIE_SECURE=1`：通过 HTTPS 反向代理部署时使用安全 Cookie。
+- `MAIL_SYNC_TRUST_PROXY=1`：允许可信反向代理提供客户端地址，用于登录限流。
+- `MAIL_SYNC_TRUSTED_PROXY_CIDRS=127.0.0.0/8,::1/128`：允许解析转发头的代理来源网段。
+- `MAIL_SYNC_HEARTBEAT_INTERVAL_SECONDS=30`：同步主循环心跳写入间隔。
+- `MAIL_SYNC_HEARTBEAT_MAX_AGE_SECONDS=600`：同步主循环最大允许无心跳时间。
+- `MAIL_SYNC_LOG_MAX_BYTES=20971520`：单个应用日志的轮转阈值。
+- `MAIL_SYNC_LOG_BACKUP_COUNT=10`：每个应用日志保留的轮转文件数。
+- `MAIL_SYNC_DEPLOY_BACKUP_KEEP=10`：重部署前一致性数据库备份的保留数量。
 
 如果部署环境需要把某个 IMAP 域名映射到内网地址，可通过环境变量覆盖：
 

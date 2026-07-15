@@ -16,6 +16,15 @@ services:
       MAIL_SYNC_STATE_DB: /app/data/mail_sync_state.sqlite3
       MAIL_SYNC_LOG_DIR: /app/logs
       MAIL_SYNC_WEB_PORT: ${MAIL_SYNC_WEB_PORT:-24000}
+      MAIL_SYNC_COOKIE_SECURE: "${MAIL_SYNC_COOKIE_SECURE:-1}"
+      MAIL_SYNC_TRUST_PROXY: "${MAIL_SYNC_TRUST_PROXY:-1}"
+      MAIL_SYNC_TRUSTED_PROXY_CIDRS: "${MAIL_SYNC_TRUSTED_PROXY_CIDRS:-127.0.0.0/8,::1/128}"
+      MAIL_SYNC_HEALTH_PATH: "${MAIL_SYNC_HEALTH_PATH:-/api/live}"
+      MAIL_SYNC_HEARTBEAT_PATH: "${MAIL_SYNC_HEARTBEAT_PATH:-/app/data/watch.heartbeat}"
+      MAIL_SYNC_HEARTBEAT_INTERVAL_SECONDS: "${MAIL_SYNC_HEARTBEAT_INTERVAL_SECONDS:-30}"
+      MAIL_SYNC_HEARTBEAT_MAX_AGE_SECONDS: "${MAIL_SYNC_HEARTBEAT_MAX_AGE_SECONDS:-600}"
+      MAIL_SYNC_LOG_MAX_BYTES: "${MAIL_SYNC_LOG_MAX_BYTES:-20971520}"
+      MAIL_SYNC_LOG_BACKUP_COUNT: "${MAIL_SYNC_LOG_BACKUP_COUNT:-10}"
       SYNC_INTERVAL: ${SYNC_INTERVAL:-900}
       SYNC_POLL_INTERVAL: ${SYNC_POLL_INTERVAL:-3}
       SYNC_BATCH_SIZE: ${SYNC_BATCH_SIZE:-5}
@@ -27,6 +36,29 @@ services:
       - ../logs:/app/logs
     ports:
       - "${MAIL_SYNC_WEB_PORT:-24000}:${MAIL_SYNC_WEB_PORT:-24000}"
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - >-
+          import http.client, os;
+          port = int(os.environ.get("MAIL_SYNC_WEB_PORT", "24000"));
+          path = os.environ.get("MAIL_SYNC_HEALTH_PATH", "/api/live");
+          connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5);
+          connection.request("GET", path, headers={"Accept": "application/json"});
+          response = connection.getresponse();
+          response.read(1);
+          connection.close();
+          raise SystemExit(0 if 200 <= response.status < 300 else 1)
+      interval: 30s
+      timeout: 6s
+      retries: 4
+      start_period: 45s
+    mem_limit: 768m
+    mem_reservation: 128m
+    cpus: "2.0"
+    pids_limit: 256
     tmpfs:
-      - /tmp
+      - /tmp:size=128m,mode=1777,nosuid,nodev
     stop_grace_period: 30s

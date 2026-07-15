@@ -206,10 +206,11 @@ SYNC_INTERVAL=900 python3 backend/mail_sync.py watch
 docker compose -f deploy/compose.yaml up -d --build
 ```
 
-查看容器日志：
+查看应用日志：
 
 ```bash
-docker compose -f deploy/compose.yaml logs -f mail-sync
+tail -f logs/web.log
+tail -f logs/sync.log
 ```
 
 Web 控制台和同步子进程会分别写入挂载日志目录：
@@ -218,6 +219,24 @@ Web 控制台和同步子进程会分别写入挂载日志目录：
 tail -f logs/web.log
 tail -f logs/sync.log
 ```
+
+日志默认按 20 MiB 轮转并各保留 10 份，可通过
+`MAIL_SYNC_LOG_MAX_BYTES` 和 `MAIL_SYNC_LOG_BACKUP_COUNT` 调整。
+
+推荐使用安全重部署脚本：
+
+```bash
+./deploy/redeploy.sh
+```
+
+脚本会先使用 SQLite Backup API 在 `data/backups/` 创建一致性备份，再构建并启动
+容器，等待 `/api/live` 通过；失败时恢复旧镜像。部署备份默认保留最近 10 份，
+可通过 `MAIL_SYNC_DEPLOY_BACKUP_KEEP` 调整。
+
+`/api/live` 检查 Web、SQLite 和同步主循环心跳；`/api/health` 在此基础上继续检查
+规则失败和待恢复操作。同步心跳默认每 30 秒写入，10 分钟未更新才判定失活，
+可通过 `MAIL_SYNC_HEARTBEAT_INTERVAL_SECONDS` 和
+`MAIL_SYNC_HEARTBEAT_MAX_AGE_SECONDS` 调整。
 
 停止服务：
 
