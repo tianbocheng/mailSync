@@ -1,5 +1,6 @@
 import base64
 import io
+import imaplib
 import json
 import os
 import tempfile
@@ -199,6 +200,96 @@ class WebConsoleTests(unittest.TestCase):
             self.assertEqual(profile["imap_proxy"]["port"], 7890)
             self.assertEqual(profile["imap_proxy"]["username"], "proxy-user")
             safe_pop_quit.assert_called_once_with(client)
+
+    def test_label_discovery_returns_json_for_imap_and_network_errors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.sqlite3"
+            with mock.patch.dict(
+                os.environ,
+                {"MAIL_SYNC_ADMIN_PASSWORD": "test-admin-password"},
+            ):
+                db = mail_sync.init_db(state_path)
+            try:
+                import_legacy_config(db, self.valid_config())
+                cookie = make_session_cookie(db, "admin").split(";", 1)[0]
+            finally:
+                db.close()
+            handler = make_handler(state_path)
+            subject = (
+                "the submission due：2026.11.13 CAD Design & Testing/"
+                "Intelligent Automation and Soft Computing"
+            )
+            failures = [
+                ("connect", OSError("connection refused")),
+                ("discover", imaplib.IMAP4.error("SEARCH rejected")),
+                ("discover", TimeoutError("timed out")),
+                ("discover", EOFError("connection closed")),
+            ]
+            for stage, error in failures:
+                with self.subTest(stage=stage, error=type(error).__name__):
+                    client = object()
+                    with (
+                        mock.patch("web.app.connect", return_value=client) as connect,
+                        mock.patch("web.app.discover_target_labels") as discover,
+                        mock.patch("web.app.safe_logout") as logout,
+                    ):
+                        if stage == "connect":
+                            connect.side_effect = error
+                        else:
+                            discover.side_effect = error
+                        status, headers, body = self.request_handler(
+                            handler,
+                            "/api/mail/labels/discover",
+                            method="POST",
+                            headers={"Cookie": cookie},
+                            form={
+                                "target_email": "target@example.com",
+                                "target_service_address": "target.example.com",
+                                "subject": subject,
+                                "message_id": "<test-message@example.com>",
+                            },
+                        )
+
+                    self.assertEqual(status, 400)
+                    self.assertIn("application/json", headers["Content-Type"])
+                    response = json.loads(body)
+                    self.assertFalse(response["ok"])
+                    self.assertIn("读取邮件标签失败", response["error"])
+                    if stage == "connect":
+                        logout.assert_not_called()
+                    else:
+                        self.assertEqual(discover.call_args.args[2], subject)
+                        self.assertEqual(
+                            discover.call_args.kwargs["message_id"],
+                            "<test-message@example.com>",
+                        )
+                        logout.assert_called_once_with(client)
+
+            with (
+                mock.patch("web.app.connect", return_value=object()),
+                mock.patch("web.app.safe_logout"),
+                mock.patch(
+                    "web.app.discover_target_labels",
+                    return_value={"lookup": "message_id", "uid": 9, "labels": []},
+                ) as discover,
+            ):
+                status, _, body = self.request_handler(
+                    handler,
+                    "/api/mail/labels/discover",
+                    method="POST",
+                    headers={"Cookie": cookie},
+                    form={
+                        "target_email": "target@example.com",
+                        "target_service_address": "target.example.com",
+                        "message_id": "<test-message@example.com>",
+                    },
+                )
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(body)["lookup"], "message_id")
+            self.assertEqual(discover.call_args.args[2], "")
+            self.assertEqual(
+                discover.call_args.kwargs["message_id"], "<test-message@example.com>"
+            )
 
     def test_saving_existing_pop_account_can_reuse_original_email(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1486,8 +1577,11 @@ class WebConsoleTests(unittest.TestCase):
                 label_panel = (FRONTEND_COMPONENTS / "LabelsPanel.vue").read_text(
                     encoding="utf-8"
                 )
-                self.assertIn("createLabel", label_panel)
-                self.assertIn("/api/mail/labels/create", (FRONTEND_API / "mail.js").read_text(encoding="utf-8"))
+                self.assertIn("读取邮件标签", label_panel)
+                self.assertIn("discoverLabels", label_panel)
+                self.assertNotIn("createForm", label_panel)
+                self.assertNotIn("createLabel", label_panel)
+                self.assertNotIn("新增标签", label_panel)
             finally:
                 db.close()
 

@@ -38,7 +38,6 @@ from imap.protocol import select_mailbox
 from imap.source import list_folders
 from monitoring.listener import idle_supported
 from storage.config_repository import (
-    create_synology_label,
     delete_mailbox_account,
     delete_proxy_profile,
     delete_sync_rule,
@@ -877,22 +876,6 @@ def make_handler(state_path: Path) -> type[BaseHTTPRequestHandler]:
                     )
                     finish("/#/mail?notice=mailbox_deleted")
                     return
-                if action_path == "/mail/labels/create":
-                    target_email = self._field(fields, "target_email")
-                    target_service = self._field(fields, "target_service_address")
-                    create_synology_label(
-                        db,
-                        target_email=target_email,
-                        target_service_address=target_service,
-                        label_id=self._field(fields, "label_id"),
-                        label_name=self._field(fields, "label_name"),
-                    )
-                    finish(
-                        f"/#/mail?email={quote(target_email)}"
-                        f"&service={quote(target_service)}"
-                        f"&dialog=labels&notice=label_created"
-                    )
-                    return
                 if action_path == "/mail/labels/discover":
                     target_email = self._field(fields, "target_email").strip()
                     target_service = self._field(fields, "target_service_address").strip()
@@ -910,16 +893,23 @@ def make_handler(state_path: Path) -> type[BaseHTTPRequestHandler]:
                             target_service,
                         )
                     }
-                    client = connect(profile)
+                    client = None
                     try:
+                        client = connect(profile)
                         result = discover_target_labels(
                             client,
                             profile.get("folder") or "INBOX",
                             self._field(fields, "subject"),
                             known_names,
+                            message_id=self._field(fields, "message_id"),
                         )
+                    except (imaplib.IMAP4.error, OSError, EOFError, UnicodeError) as exc:
+                        # A failed IMAP request must still produce an HTTP
+                        # response, otherwise reverse proxies report a 502.
+                        raise SyncError(f"读取邮件标签失败：{exc}") from exc
                     finally:
-                        safe_logout(client)
+                        if client is not None:
+                            safe_logout(client)
                     self._send_json({"ok": True, **result})
                     return
                 if action_path == "/mail/labels/update":

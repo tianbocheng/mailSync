@@ -1,21 +1,19 @@
 <template>
   <div>
-    <el-form :model="createForm" inline @submit.prevent>
-      <el-form-item label="测试邮件主题">
+    <el-form inline @submit.prevent>
+      <el-form-item label="邮件 Message-ID（推荐）">
+        <el-input
+          v-model="discoverMessageId"
+          placeholder="例如 <abc@example.com>"
+        />
+      </el-form-item>
+      <el-form-item label="测试邮件主题（备用）">
         <el-input
           v-model="discoverSubject"
-          placeholder="输入已加标签的邮件主题"
-          class="subject-input"
+          placeholder="Message-ID 不可用时输入主题"
         />
       </el-form-item>
       <el-button :loading="discovering" @click="discoverLabels">读取邮件标签</el-button>
-      <el-form-item label="内部 ID">
-        <el-input v-model="createForm.label_id" placeholder="$label" />
-      </el-form-item>
-      <el-form-item label="显示名称">
-        <el-input v-model="createForm.label_name" />
-      </el-form-item>
-      <el-button type="primary" :loading="creating" @click="createLabel">新增标签</el-button>
     </el-form>
 
     <el-alert
@@ -23,25 +21,14 @@
       type="info"
       :closable="false"
       class="label-discovery"
-      title="已读取测试邮件标签。IMAP 只能提供内部 ID；本地已有映射会自动带出名称，新标签请补充显示名称后点“使用”。"
+      title="已读取测试邮件标签。IMAP 只能提供内部 ID；本地已有映射会自动带出名称，未知标签的名称请在下方映射表中维护。"
     />
     <el-table v-if="discoveredLabels.length" :data="discoveredLabels" class="result-box discovery-table">
       <el-table-column prop="label_id" label="发现的内部 ID" min-width="220" />
-      <el-table-column label="显示名称" min-width="220">
+      <el-table-column prop="label_name" label="显示名称" min-width="220" />
+      <el-table-column label="状态" width="100">
         <template #default="{ row }">
-          <el-input v-model="row.edit_label_name" :placeholder="row.known ? '' : '请输入 MailPlus 标签名称'" />
-        </template>
-      </el-table-column>
-      <el-table-column label="操作" width="100">
-        <template #default="{ row }">
-          <el-button
-            link
-            type="primary"
-            :disabled="row.known"
-            @click="useDiscoveredLabel(row)"
-          >
-            {{ row.known ? "已存在" : "使用" }}
-          </el-button>
+          {{ row.known ? "已存在" : "未映射" }}
         </template>
       </el-table-column>
     </el-table>
@@ -89,7 +76,7 @@
 </template>
 
 <script setup>
-import { computed, reactive, ref, watch } from "vue";
+import { computed, ref, watch } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 
 import { mailApi } from "@/api/mail";
@@ -103,14 +90,10 @@ const props = defineProps({
 
 const emit = defineEmits(["reload"]);
 
-const createForm = reactive({
-  label_id: "",
-  label_name: "",
-});
 const discoverSubject = ref("");
+const discoverMessageId = ref("");
 const discoveredLabels = ref([]);
 const labels = ref([]);
-const creating = ref(false);
 const discovering = ref(false);
 const currentPage = ref(1);
 const pageSize = ref(10);
@@ -147,40 +130,17 @@ function mailboxFields() {
   };
 }
 
-async function createLabel() {
-  creating.value = true;
-  try {
-    const result = await mailApi.createLabel({
-      ...mailboxFields(),
-      label_id: createForm.label_id,
-      label_name: createForm.label_name,
-    });
-    createForm.label_id = "";
-    createForm.label_name = "";
-    window.MailSyncApplyRedirect?.(result);
-  } catch (error) {
-    ElMessage.error(error.message || "新增失败。");
-  } finally {
-    creating.value = false;
-  }
-}
-
 async function discoverLabels() {
   discovering.value = true;
   try {
     const result = await mailApi.discoverLabels({
       ...mailboxFields(),
+      message_id: discoverMessageId.value,
       subject: discoverSubject.value,
     });
-    discoveredLabels.value = (result.labels || []).map((label) => ({
-      ...label,
-      edit_label_name: label.label_name || "",
-    }));
-    if (discoveredLabels.value.length === 1 && !discoveredLabels.value[0].known) {
-      useDiscoveredLabel(discoveredLabels.value[0]);
-    }
+    discoveredLabels.value = result.labels || [];
     if (result.unknown_ids?.length) {
-      ElMessage.info("发现了新标签 ID，请补充显示名称后使用。");
+      ElMessage.info("发现了新标签 ID；IMAP 不会返回标签名称，请在下方映射表中维护名称。");
     } else {
       ElMessage.success(`已读取 ${discoveredLabels.value.length} 个标签。`);
     }
@@ -189,11 +149,6 @@ async function discoverLabels() {
   } finally {
     discovering.value = false;
   }
-}
-
-function useDiscoveredLabel(row) {
-  createForm.label_id = row.label_id || "";
-  createForm.label_name = row.edit_label_name || row.label_name || "";
 }
 
 async function updateLabel(row) {

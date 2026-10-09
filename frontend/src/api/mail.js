@@ -22,9 +22,6 @@ export const mailApi = {
   outlookComplete(fields) {
     return postJson("/api/mail/outlook/complete", fields, { allowOkFalse: true });
   },
-  createLabel(fields) {
-    return postJson("/api/mail/labels/create", fields);
-  },
   discoverLabels(fields) {
     return postJson("/api/mail/labels/discover", fields);
   },
