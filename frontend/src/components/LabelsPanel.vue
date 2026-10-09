@@ -1,16 +1,10 @@
 <template>
   <div>
     <el-form inline @submit.prevent>
-      <el-form-item label="邮件 Message-ID（推荐）">
+      <el-form-item label="邮件 Message-ID">
         <el-input
           v-model="discoverMessageId"
           placeholder="例如 <abc@example.com>"
-        />
-      </el-form-item>
-      <el-form-item label="测试邮件主题（备用）">
-        <el-input
-          v-model="discoverSubject"
-          placeholder="Message-ID 不可用时输入主题"
         />
       </el-form-item>
       <el-button :loading="discovering" @click="discoverLabels">读取邮件标签</el-button>
@@ -90,7 +84,6 @@ const props = defineProps({
 
 const emit = defineEmits(["reload"]);
 
-const discoverSubject = ref("");
 const discoverMessageId = ref("");
 const discoveredLabels = ref([]);
 const labels = ref([]);
@@ -136,7 +129,6 @@ async function discoverLabels() {
     const result = await mailApi.discoverLabels({
       ...mailboxFields(),
       message_id: discoverMessageId.value,
-      subject: discoverSubject.value,
     });
     discoveredLabels.value = result.labels || [];
     if (result.unknown_ids?.length) {
