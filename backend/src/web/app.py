@@ -32,6 +32,7 @@ from common.clock import now_iso
 from common.errors import SyncError
 from config.validation import MICROSOFT_IMAP_SCOPE
 from connection import connect, connect_pop, safe_logout, safe_pop_quit
+from imap.labels import discover_target_labels
 from imap.probe import run_imap_mailbox_probe
 from imap.protocol import select_mailbox
 from imap.source import list_folders
@@ -44,6 +45,7 @@ from storage.config_repository import (
     delete_sync_rule_logs,
     delete_synology_label,
     list_proxy_profiles,
+    list_synology_labels,
     mailbox_account_profile,
     save_mailbox_account,
     save_mailbox_probe_results,
@@ -890,6 +892,35 @@ def make_handler(state_path: Path) -> type[BaseHTTPRequestHandler]:
                         f"&service={quote(target_service)}"
                         f"&dialog=labels&notice=label_created"
                     )
+                    return
+                if action_path == "/mail/labels/discover":
+                    target_email = self._field(fields, "target_email").strip()
+                    target_service = self._field(fields, "target_service_address").strip()
+                    profile = mailbox_account_profile(
+                        db,
+                        "target",
+                        target_email,
+                        target_service,
+                    )
+                    known_names = {
+                        row["label_id"]: row["label_name"]
+                        for row in list_synology_labels(
+                            db,
+                            target_email,
+                            target_service,
+                        )
+                    }
+                    client = connect(profile)
+                    try:
+                        result = discover_target_labels(
+                            client,
+                            profile.get("folder") or "INBOX",
+                            self._field(fields, "subject"),
+                            known_names,
+                        )
+                    finally:
+                        safe_logout(client)
+                    self._send_json({"ok": True, **result})
                     return
                 if action_path == "/mail/labels/update":
                     target_email = self._field(fields, "target_email")

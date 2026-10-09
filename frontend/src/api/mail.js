@@ -25,6 +25,9 @@ export const mailApi = {
   createLabel(fields) {
     return postJson("/api/mail/labels/create", fields);
   },
+  discoverLabels(fields) {
+    return postJson("/api/mail/labels/discover", fields);
+  },
   updateLabel(fields) {
     return postJson("/api/mail/labels/update", fields);
   },

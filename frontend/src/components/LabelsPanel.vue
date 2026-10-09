@@ -1,6 +1,14 @@
 <template>
   <div>
     <el-form :model="createForm" inline @submit.prevent>
+      <el-form-item label="测试邮件主题">
+        <el-input
+          v-model="discoverSubject"
+          placeholder="输入已加标签的邮件主题"
+          class="subject-input"
+        />
+      </el-form-item>
+      <el-button :loading="discovering" @click="discoverLabels">读取邮件标签</el-button>
       <el-form-item label="内部 ID">
         <el-input v-model="createForm.label_id" placeholder="$label" />
       </el-form-item>
@@ -9,6 +17,34 @@
       </el-form-item>
       <el-button type="primary" :loading="creating" @click="createLabel">新增标签</el-button>
     </el-form>
+
+    <el-alert
+      v-if="discoveredLabels.length"
+      type="info"
+      :closable="false"
+      class="label-discovery"
+      title="已读取测试邮件标签。IMAP 只能提供内部 ID；本地已有映射会自动带出名称，新标签请补充显示名称后点“使用”。"
+    />
+    <el-table v-if="discoveredLabels.length" :data="discoveredLabels" class="result-box discovery-table">
+      <el-table-column prop="label_id" label="发现的内部 ID" min-width="220" />
+      <el-table-column label="显示名称" min-width="220">
+        <template #default="{ row }">
+          <el-input v-model="row.edit_label_name" :placeholder="row.known ? '' : '请输入 MailPlus 标签名称'" />
+        </template>
+      </el-table-column>
+      <el-table-column label="操作" width="100">
+        <template #default="{ row }">
+          <el-button
+            link
+            type="primary"
+            :disabled="row.known"
+            @click="useDiscoveredLabel(row)"
+          >
+            {{ row.known ? "已存在" : "使用" }}
+          </el-button>
+        </template>
+      </el-table-column>
+    </el-table>
 
     <el-table :data="pagedLabels" empty-text="暂无标签" class="result-box">
       <el-table-column label="内部 ID" min-width="180">
@@ -71,8 +107,11 @@ const createForm = reactive({
   label_id: "",
   label_name: "",
 });
+const discoverSubject = ref("");
+const discoveredLabels = ref([]);
 const labels = ref([]);
 const creating = ref(false);
+const discovering = ref(false);
 const currentPage = ref(1);
 const pageSize = ref(10);
 
@@ -124,6 +163,37 @@ async function createLabel() {
   } finally {
     creating.value = false;
   }
+}
+
+async function discoverLabels() {
+  discovering.value = true;
+  try {
+    const result = await mailApi.discoverLabels({
+      ...mailboxFields(),
+      subject: discoverSubject.value,
+    });
+    discoveredLabels.value = (result.labels || []).map((label) => ({
+      ...label,
+      edit_label_name: label.label_name || "",
+    }));
+    if (discoveredLabels.value.length === 1 && !discoveredLabels.value[0].known) {
+      useDiscoveredLabel(discoveredLabels.value[0]);
+    }
+    if (result.unknown_ids?.length) {
+      ElMessage.info("发现了新标签 ID，请补充显示名称后使用。");
+    } else {
+      ElMessage.success(`已读取 ${discoveredLabels.value.length} 个标签。`);
+    }
+  } catch (error) {
+    ElMessage.error(error.message || "读取标签失败。");
+  } finally {
+    discovering.value = false;
+  }
+}
+
+function useDiscoveredLabel(row) {
+  createForm.label_id = row.label_id || "";
+  createForm.label_name = row.edit_label_name || row.label_name || "";
 }
 
 async function updateLabel(row) {
