@@ -893,12 +893,30 @@ def make_handler(state_path: Path) -> type[BaseHTTPRequestHandler]:
                             target_service,
                         )
                     }
+                    target_folder = profile.get("folder") or "INBOX"
+                    message_id = self._field(fields, "message_id").strip()
+                    if message_id:
+                        stored = db.execute(
+                            """
+                            SELECT target_folder
+                            FROM messages
+                            WHERE message_id=?
+                              AND target_email=?
+                              AND target_service_address=?
+                              AND target_folder IS NOT NULL
+                              AND target_folder <> ''
+                            LIMIT 1
+                            """,
+                            (message_id, target_email, target_service),
+                        ).fetchone()
+                        if stored is not None:
+                            target_folder = stored["target_folder"]
                     client = None
                     try:
                         client = connect(profile)
                         result = discover_target_labels(
                             client,
-                            profile.get("folder") or "INBOX",
+                            target_folder,
                             self._field(fields, "subject"),
                             known_names,
                             message_id=self._field(fields, "message_id"),
